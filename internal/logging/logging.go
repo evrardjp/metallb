@@ -1,3 +1,5 @@
+// SPDX-License-Identifier:Apache-2.0
+
 // Package logging sets up structured logging in a uniform way, and
 // redirects glog statements into the structured log.
 package logging
@@ -9,26 +11,41 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"go.uber.org/zap/zapcore"
 	"k8s.io/klog"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 const (
-	levelAll   = "all"
-	levelDebug = "debug"
-	levelInfo  = "info"
-	levelWarn  = "warn"
-	levelError = "error"
-	levelNone  = "none"
+	LevelAll   = "all"
+	LevelDebug = "debug"
+	LevelInfo  = "info"
+	LevelWarn  = "warn"
+	LevelError = "error"
+	LevelNone  = "none"
 )
+
+type Level string
+type levelSlice []Level
 
 var (
 	// Levels returns an array of valid log levels.
-	Levels = []string{levelAll, levelDebug, levelInfo, levelWarn, levelError, levelNone}
+	Levels = levelSlice{LevelAll, LevelDebug, LevelInfo, LevelWarn, LevelError, LevelNone}
 )
+
+func (l levelSlice) String() string {
+	strs := make([]string, len(l))
+	for i, v := range l {
+		strs[i] = string(v)
+	}
+	return strings.Join(strs, ", ")
+}
 
 // Init returns a logger configured with common settings like
 // timestamping and source code locations. Both the stdlib logger and
@@ -53,11 +70,37 @@ func Init(lvl string) (log.Logger, error) {
 		return nil, err
 	}
 
-	return level.NewFilter(log.With(l, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller), opt), nil
+	timeStampValuer := log.TimestampFormat(time.Now, time.RFC3339)
+	l = log.With(l, "ts", timeStampValuer)
+	l = level.NewFilter(l, opt)
+
+	// Note: caller must be added after everything else that decorates the
+	// logger (otherwise we get incorrect caller reference).
+	l = log.With(l, "caller", log.DefaultCaller)
+
+	// Setting a controller-runtime logger is required to
+	// get any log created by it.
+	logEnabler, err := zapLogLevel(lvl)
+	if err != nil {
+		return nil, err
+	}
+	runtimeLogger := zap.New(func(o *zap.Options) {
+		o.Level = logEnabler
+		o.StacktraceLevel = logEnabler
+	})
+	ctrl.SetLogger(runtimeLogger)
+
+	return l, nil
 }
 
 func collectGlogs(f *os.File, logger log.Logger) {
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			// cant log here, as this is the logger
+			errorString := fmt.Sprintf("Error closing file: %s", err)
+			panic(errorString)
+		}
+	}()
 
 	r := bufio.NewReader(f)
 	for {
@@ -143,18 +186,37 @@ func deformat(logger log.Logger, b []byte) (leveledLogger log.Logger, ts time.Ti
 
 func parseLevel(lvl string) (level.Option, error) {
 	switch lvl {
-	case levelAll:
+	case LevelAll:
 		return level.AllowAll(), nil
-	case levelDebug:
+	case LevelDebug:
 		return level.AllowDebug(), nil
-	case levelInfo:
+	case LevelInfo:
 		return level.AllowInfo(), nil
-	case levelWarn:
+	case LevelWarn:
 		return level.AllowWarn(), nil
-	case levelError:
+	case LevelError:
 		return level.AllowError(), nil
-	case levelNone:
+	case LevelNone:
 		return level.AllowNone(), nil
+	}
+
+	return nil, fmt.Errorf("failed to parse log level: %s", lvl)
+}
+
+func zapLogLevel(lvl string) (zapcore.LevelEnabler, error) {
+	switch lvl {
+	case LevelAll:
+		return zapcore.DebugLevel, nil
+	case LevelDebug:
+		return zapcore.DebugLevel, nil
+	case LevelInfo:
+		return zapcore.InfoLevel, nil
+	case LevelWarn:
+		return zapcore.WarnLevel, nil
+	case LevelError:
+		return zapcore.ErrorLevel, nil
+	case LevelNone:
+		return zapcore.FatalLevel, nil
 	}
 
 	return nil, fmt.Errorf("failed to parse log level: %s", lvl)

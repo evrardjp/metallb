@@ -1,6 +1,11 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package layer2
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+)
 
 var stats = metrics{
 	in: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -38,9 +43,9 @@ type metrics struct {
 }
 
 func init() {
-	prometheus.MustRegister(stats.in)
-	prometheus.MustRegister(stats.out)
-	prometheus.MustRegister(stats.gratuitous)
+	crmetrics.Registry.MustRegister(stats.in)
+	crmetrics.Registry.MustRegister(stats.out)
+	crmetrics.Registry.MustRegister(stats.gratuitous)
 }
 
 func (m *metrics) GotRequest(addr string) {

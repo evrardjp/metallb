@@ -1,0 +1,395 @@
+/*
+
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	metallbv1beta1 "go.universe.tf/metallb/api/v1beta1"
+	metallbv1beta2 "go.universe.tf/metallb/api/v1beta2"
+	"go.universe.tf/metallb/internal/config"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+)
+
+const bgpExtrasConfigName = "bgpextras"
+
+type ConfigReconciler struct {
+	client.Client
+	Logger                  log.Logger
+	Scheme                  *runtime.Scheme
+	Namespace               string
+	Handler                 func(log.Logger, *config.Config) SyncState
+	ValidateConfig          config.Validate
+	ForceReload             func()
+	BGPType                 string
+	ConfigStateName         string
+	currentConfig           *config.Config
+	NodeName                string
+	FRRK8sSecretPassthrough bool
+}
+
+func (r *ConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	return requestHandler(r, ctx, req)
+}
+
+var requestHandler = func(r *ConfigReconciler, ctx context.Context, req ctrl.Request) (result ctrl.Result, handlerError error) {
+	level.Info(r.Logger).Log("controller", "ConfigReconciler", "start reconcile", req.String())
+	defer level.Info(r.Logger).Log("controller", "ConfigReconciler", "end reconcile", req.String())
+
+	var conditionErr error
+	defer func() {
+		if err := r.reportCondition(ctx, conditionErr); err != nil {
+			level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to report condition", "error", err)
+			// According to Go spec (https://go.dev/ref/spec#Defer_statements), deferred functions
+			// execute after return statements set the result parameters but before returning to caller,
+			// allowing this function to modify handlerError.
+			handlerError = errors.Join(handlerError, err)
+		}
+	}()
+
+	updates.Inc()
+
+	var ipAddressPools metallbv1beta1.IPAddressPoolList
+	if err := r.List(ctx, &ipAddressPools, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "error", "failed to get ipaddresspools", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var bgpPeers metallbv1beta2.BGPPeerList
+	if err := r.List(ctx, &bgpPeers, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get bgppeers", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var bfdProfiles metallbv1beta1.BFDProfileList
+	if err := r.List(ctx, &bfdProfiles, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get bfdprofiles", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var l2Advertisements metallbv1beta1.L2AdvertisementList
+	if err := r.List(ctx, &l2Advertisements, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get l2 advertisements", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var bgpAdvertisements metallbv1beta1.BGPAdvertisementList
+	if err := r.List(ctx, &bgpAdvertisements, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get bgp advertisements", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var communities metallbv1beta1.CommunityList
+	if err := r.List(ctx, &communities, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "error", "failed to get communities", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	secrets, err := r.getSecrets(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get nodes", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var namespaces corev1.NamespaceList
+	if err := r.List(ctx, &namespaces); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get namespaces", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	var extrasMap corev1.ConfigMap
+	key := client.ObjectKey{Name: bgpExtrasConfigName, Namespace: r.Namespace}
+	if err := r.Get(ctx, key, &extrasMap); err != nil && !apierrors.IsNotFound(err) {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get the frr configmap", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	// A BGP speaker should only care about the resources corresponding to it. Therefore, filter BGPAdvertisements,
+	// BGPPeers by the node name. If configuration is invalid, only the configurationstate for
+	// the concerned speaker will flag an error. In theory, it would be possible to filter IPPools, as well.
+	// However, this is cumbersome and the webhooks make it impossible for the user to push invalid configuration for
+	// pools, so the cost for filtering pools is not justified. We also deliberately do not filter L2Advertisements:
+	// the speakers need to know about all of the ads to build the proper candidate set for a service, therefore
+	// filtering would break this.
+	var node corev1.Node
+	key = client.ObjectKey{Name: r.NodeName}
+	if err := r.Get(ctx, key, &node); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to get node for "+r.NodeName, "error", err)
+		return ctrl.Result{}, err
+	}
+
+	bgpAdvs, err := filterBGPAdvertisementsByNode(bgpAdvertisements.Items, node)
+	if err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to filter BGPAdvertisements", "error", err)
+		return ctrl.Result{}, err
+	}
+	peers, err := filterBGPPeersByNode(bgpPeers.Items, node)
+	if err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "message", "failed to filter BGPPeers", "error", err)
+		return ctrl.Result{}, err
+	}
+
+	resources := config.ClusterResources{
+		Pools:           ipAddressPools.Items,
+		Peers:           peers,
+		BFDProfiles:     bfdProfiles.Items,
+		L2Advs:          l2Advertisements.Items,
+		BGPAdvs:         bgpAdvs,
+		Communities:     communities.Items,
+		PasswordSecrets: secrets,
+		Nodes:           nodes.Items,
+		Namespaces:      namespaces.Items,
+		BGPExtras:       extrasMap,
+	}
+
+	level.Debug(r.Logger).Log("controller", "ConfigReconciler", "metallb CRs and Secrets", dumpClusterResources(&resources))
+
+	cfg, err := toConfig(resources, r.ValidateConfig, config.ForOptions{
+		FRRK8sSecretPassthrough: r.FRRK8sSecretPassthrough,
+	})
+	if err != nil {
+		configStale.Set(1)
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "error", "failed to parse the configuration", "error", err)
+		conditionErr = fmt.Errorf("%w: %w", ErrConfiguration, err)
+		return ctrl.Result{}, nil
+	}
+
+	if cfg.BGPExtras != "" {
+		level.Info(r.Logger).Log("controller", "ConfigReconciler", "warning message", "BGP Extras provided, please note that this configuration is not supported and used at your own risk")
+	}
+	level.Debug(r.Logger).Log("controller", "ConfigReconciler", "rendered config", dumpConfig(cfg))
+	if r.currentConfig != nil && reflect.DeepEqual(r.currentConfig, cfg) {
+		level.Debug(r.Logger).Log("controller", "ConfigReconciler", "event", "configuration did not change, ignoring")
+		return ctrl.Result{}, nil
+	}
+
+	r.currentConfig = cfg
+
+	res := r.Handler(r.Logger, cfg)
+	switch res {
+	case SyncStateError:
+		configStale.Set(1)
+		updateErrors.Inc()
+		// if the configuration load failed, we reset the current config because this is gonna lead to a retry
+		// of the reconciliaton loop. If we don't reset, the retry will find the config identical and will exit,
+		// which is not what we want here.
+		r.currentConfig = nil
+		conditionErr = fmt.Errorf("%w: general handler sync state error", ErrConfiguration)
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "metallb CRs and Secrets", dumpClusterResources(&resources), "event", "reload failed, retry")
+		return ctrl.Result{}, errRetry
+	case SyncStateReprocessAll:
+		level.Info(r.Logger).Log("controller", "ConfigReconciler", "event", "force service reload")
+		r.ForceReload()
+	case SyncStateErrorNoRetry:
+		configStale.Set(1)
+		updateErrors.Inc()
+		conditionErr = fmt.Errorf("%w: general handler sync state error", ErrConfiguration)
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "metallb CRs and Secrets", dumpClusterResources(&resources), "event", "reload failed, no retry")
+		return ctrl.Result{}, nil
+	}
+
+	configLoaded.Set(1)
+	configStale.Set(0)
+	level.Info(r.Logger).Log("controller", "ConfigReconciler", "event", "config reloaded")
+	return ctrl.Result{}, nil
+}
+
+func (r *ConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	p := predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			return filterNodeEvent(e) && filterNamespaceEvent(e) && filterConfigmapEvent(e)
+		},
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&metallbv1beta2.BGPPeer{}).
+		Watches(&metallbv1beta1.IPAddressPool{}, &handler.EnqueueRequestForObject{}).
+		Watches(&corev1.Node{}, &handler.EnqueueRequestForObject{}).
+		Watches(&metallbv1beta1.BGPAdvertisement{}, &handler.EnqueueRequestForObject{}).
+		Watches(&metallbv1beta1.L2Advertisement{}, &handler.EnqueueRequestForObject{}).
+		Watches(&metallbv1beta1.BFDProfile{}, &handler.EnqueueRequestForObject{}).
+		Watches(&metallbv1beta1.Community{}, &handler.EnqueueRequestForObject{}).
+		Watches(&corev1.Secret{}, &handler.EnqueueRequestForObject{}).
+		Watches(&corev1.Namespace{}, &handler.EnqueueRequestForObject{}).
+		Watches(&corev1.ConfigMap{}, &handler.EnqueueRequestForObject{}).
+		Watches(&metallbv1beta1.ConfigurationState{}, &handler.EnqueueRequestForObject{},
+			builder.WithPredicates(NewConfigStateConditionReporterPredicate(r.Namespace, r.ConfigStateName))).
+		WithEventFilter(p).
+		Complete(r)
+}
+
+func filterNodeEvent(e event.UpdateEvent) bool {
+	newNodeObj, ok := e.ObjectNew.(*corev1.Node)
+	if !ok {
+		return true
+	}
+	oldNodeObj, ok := e.ObjectOld.(*corev1.Node)
+	if !ok {
+		return true
+	}
+	if labels.Equals(labels.Set(oldNodeObj.Labels), labels.Set(newNodeObj.Labels)) {
+		return false
+	}
+	return true
+}
+
+func filterNamespaceEvent(e event.UpdateEvent) bool {
+	newNamespaceObj, ok := e.ObjectNew.(*corev1.Namespace)
+	if !ok {
+		return true
+	}
+	oldNamespaceObj, ok := e.ObjectOld.(*corev1.Namespace)
+	if !ok {
+		return true
+	}
+	// If there is no changes in namespace labels, ignore event.
+	if labels.Equals(labels.Set(oldNamespaceObj.Labels), labels.Set(newNamespaceObj.Labels)) {
+		return false
+	}
+	return true
+}
+
+func filterConfigmapEvent(e event.UpdateEvent) bool {
+	cm, ok := e.ObjectNew.(*corev1.ConfigMap)
+	if !ok {
+		return true
+	}
+	if cm.Name != bgpExtrasConfigName {
+		return false
+	}
+	return true
+}
+
+func (r *ConfigReconciler) getSecrets(ctx context.Context) (map[string]corev1.Secret, error) {
+	var secrets corev1.SecretList
+	if err := r.List(ctx, &secrets, client.InNamespace(r.Namespace)); err != nil {
+		level.Error(r.Logger).Log("controller", "ConfigReconciler", "error", "failed to get secrets", "error", err)
+		return nil, err
+	}
+	secretsMap := make(map[string]corev1.Secret)
+	for _, secret := range secrets.Items {
+		secretsMap[secret.Name] = secret
+	}
+	return secretsMap, nil
+}
+
+func (r *ConfigReconciler) reportCondition(ctx context.Context, conditionErr error) error {
+	if r.ConfigStateName == "" {
+		return nil
+	}
+
+	condition := metav1.Condition{
+		Type:    ConditionTypeConfigReconcilerValid,
+		Status:  metav1.ConditionTrue,
+		Reason:  ErrorTypeNone,
+		Message: "",
+		// Always set to now (tracks last reconciliation, not last status change).
+		LastTransitionTime: metav1.Now(),
+	}
+
+	switch {
+	case errors.Is(conditionErr, ErrConfiguration):
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = ErrorTypeConfiguration
+		condition.Message = conditionErr.Error()
+	case conditionErr != nil:
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = ErrorTypeUnknown
+		condition.Message = conditionErr.Error()
+	}
+
+	configStatus := &metallbv1beta1.ConfigurationState{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "metallb.io/v1beta1",
+			Kind:       "ConfigurationState",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      r.ConfigStateName,
+			Namespace: r.Namespace,
+		},
+		Status: metallbv1beta1.ConfigurationStateStatus{
+			Conditions: []metav1.Condition{condition},
+		},
+	}
+
+	if err := r.Status().Patch(ctx, configStatus, client.Apply, client.FieldOwner("configReconciler"), client.ForceOwnership); err != nil { //nolint:staticcheck // TODO: migrate to client.Client.Apply()
+		return fmt.Errorf("patch %s/%s: %w", r.Namespace, r.ConfigStateName, err)
+	}
+
+	return nil
+}
+
+// filterBGPAdvertisementsByNode takes a slice of bgpAdvertisements and a node. It will return all
+// bgpAdvertisements that fulfill either condition:
+// - they have an empty nodeSelector
+// - their nodeSelector matches the provided node.
+func filterBGPAdvertisementsByNode(bgpAdvertisements []metallbv1beta1.BGPAdvertisement, node corev1.Node) ([]metallbv1beta1.BGPAdvertisement, error) {
+	return filterByNode(bgpAdvertisements, node, func(bgpAdv metallbv1beta1.BGPAdvertisement) []metav1.LabelSelector {
+		return bgpAdv.Spec.NodeSelectors
+	})
+}
+
+// filterBGPPeersByNode takes a slice of bgpPeers and a node. It will return all
+// bgpPeers that fulfill either condition:
+// - they have an empty nodeSelector
+// - their nodeSelector matches the provided node.
+func filterBGPPeersByNode(bgpPeers []metallbv1beta2.BGPPeer, node corev1.Node) ([]metallbv1beta2.BGPPeer, error) {
+	return filterByNode(bgpPeers, node, func(bgpPeer metallbv1beta2.BGPPeer) []metav1.LabelSelector {
+		return bgpPeer.Spec.NodeSelectors
+	})
+}
+
+// filterByNode implements the business logic for the more specific filter functions such as filterBGPPeersByNode.
+func filterByNode[T any](customResources []T, node corev1.Node, getNodeSelector func(T) []metav1.LabelSelector) ([]T, error) {
+	filteredCustomResources := make([]T, 0, len(customResources))
+	for _, customResource := range customResources {
+		ns := getNodeSelector(customResource)
+		// If the custom resource has no node selector, it matches all nodes.
+		if len(ns) == 0 {
+			filteredCustomResources = append(filteredCustomResources, customResource)
+			continue
+		}
+		// Otherwise, filter by label selector. If the label selector matches our node, append the custom resource.
+		nodes, err := config.FilterNodesWithLabelSelector([]corev1.Node{node}, ns)
+		if err != nil {
+			return nil, err
+		}
+		if len(nodes) > 0 {
+			filteredCustomResources = append(filteredCustomResources, customResource)
+		}
+	}
+	return filteredCustomResources, nil
+}

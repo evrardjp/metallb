@@ -1,16 +1,19 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package layer2
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/mdlayher/ndp"
 )
 
-type ndpResponder struct {
+type ndpClient struct {
 	logger       log.Logger
 	intf         string
 	hardwareAddr net.HardwareAddr
@@ -22,14 +25,14 @@ type ndpResponder struct {
 	solicitedNodeGroups map[string]int64
 }
 
-func newNDPResponder(logger log.Logger, ifi *net.Interface, ann announceFunc) (*ndpResponder, error) {
+func newNDPClient(logger log.Logger, ifi *net.Interface, ann announceFunc) (*ndpClient, error) {
 	// Use link-local address as the source IPv6 address for NDP communications.
 	conn, _, err := ndp.Dial(ifi, ndp.LinkLocal)
 	if err != nil {
 		return nil, fmt.Errorf("creating NDP responder for %q: %s", ifi.Name, err)
 	}
 
-	ret := &ndpResponder{
+	ret := &ndpClient{
 		logger:              logger,
 		intf:                ifi.Name,
 		hardwareAddr:        ifi.HardwareAddr,
@@ -42,20 +45,20 @@ func newNDPResponder(logger log.Logger, ifi *net.Interface, ann announceFunc) (*
 	return ret, nil
 }
 
-func (n *ndpResponder) Interface() string { return n.intf }
+func (n *ndpClient) Interface() string { return n.intf }
 
-func (n *ndpResponder) Close() error {
+func (n *ndpClient) Close() error {
 	close(n.closed)
 	return n.conn.Close()
 }
 
-func (n *ndpResponder) Gratuitous(ip net.IP) error {
+func (n *ndpClient) Gratuitous(ip net.IP) error {
 	err := n.advertise(net.IPv6linklocalallnodes, ip, true)
 	stats.SentGratuitous(ip.String())
 	return err
 }
 
-func (n *ndpResponder) Watch(ip net.IP) error {
+func (n *ndpClient) Watch(ip net.IP) error {
 	if ip.To4() != nil {
 		return nil
 	}
@@ -72,7 +75,7 @@ func (n *ndpResponder) Watch(ip net.IP) error {
 	return nil
 }
 
-func (n *ndpResponder) Unwatch(ip net.IP) error {
+func (n *ndpClient) Unwatch(ip net.IP) error {
 	if ip.To4() != nil {
 		return nil
 	}
@@ -89,12 +92,12 @@ func (n *ndpResponder) Unwatch(ip net.IP) error {
 	return nil
 }
 
-func (n *ndpResponder) run() {
+func (n *ndpClient) run() {
 	for n.processRequest() != dropReasonClosed {
 	}
 }
 
-func (n *ndpResponder) processRequest() dropReason {
+func (n *ndpClient) processRequest() dropReason {
 	msg, _, src, err := n.conn.ReadFrom()
 	if err != nil {
 		select {
@@ -102,7 +105,7 @@ func (n *ndpResponder) processRequest() dropReason {
 			return dropReasonClosed
 		default:
 		}
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return dropReasonClosed
 		}
 		return dropReasonError
@@ -133,7 +136,11 @@ func (n *ndpResponder) processRequest() dropReason {
 	}
 
 	// Ignore NDP requests that the announcer tells us to ignore.
-	if reason := n.announce(ns.TargetAddress); reason != dropReasonNone {
+	reason := n.announce(ns.TargetAddress, n.intf)
+	if reason == dropReasonNotMatchInterface {
+		level.Debug(n.logger).Log("op", "ndpRequestIgnore", "ip", ns.TargetAddress, "interface", n.intf, "reason", "notMatchInterface")
+	}
+	if reason != dropReasonNone {
 		return reason
 	}
 
@@ -141,14 +148,14 @@ func (n *ndpResponder) processRequest() dropReason {
 	level.Debug(n.logger).Log("interface", n.intf, "ip", ns.TargetAddress, "senderIP", src, "senderLLAddr", nsLLAddr, "responseMAC", n.hardwareAddr, "msg", "got NDP request for service IP, sending response")
 
 	if err := n.advertise(src, ns.TargetAddress, false); err != nil {
-		level.Error(n.logger).Log("op", "arpReply", "interface", n.intf, "ip", ns.TargetAddress, "senderIP", src, "senderLLAddr", nsLLAddr, "responseMAC", n.hardwareAddr, "error", err, "msg", "failed to send ARP reply")
+		level.Error(n.logger).Log("op", "ndpReply", "interface", n.intf, "ip", ns.TargetAddress, "senderIP", src, "senderLLAddr", nsLLAddr, "responseMAC", n.hardwareAddr, "error", err, "msg", "failed to send ARP reply")
 	} else {
 		stats.SentResponse(ns.TargetAddress.String())
 	}
 	return dropReasonNone
 }
 
-func (n *ndpResponder) advertise(dst, target net.IP, gratuitous bool) error {
+func (n *ndpClient) advertise(dst, target net.IP, gratuitous bool) error {
 	m := &ndp.NeighborAdvertisement{
 		Solicited:     !gratuitous, // <Adam Jensen> I never asked for this...
 		Override:      gratuitous,  // Should clients replace existing cache entries

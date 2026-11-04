@@ -98,9 +98,9 @@ New() method which are currently:
 
 * **addr**: IP address and port of peer
 * **srcAddr**: Source IP address
-* **asn**: Local ASN
+* **myASN**: Local ASN
 * **routerID**: Specify the BGP Router ID of the session
-* **peerASN**: ASN of the router that we are connecting to
+* **asn**: ASN of the router that we are connecting to
 * **holdTime**: BGP Hold Time specifies how long to maintain sessions for
 * **Password**: TCP MD5 sock option for connection
 * **myNode**
@@ -126,4 +126,4 @@ A Kubernetes client/watcher.
 
 New BGP sessions are established by calling newBGP() in the speaker's "main"
 package which calls bgp.New() which in turn returns a session interface. The session
-interface is the main interfae used to advertise prefixes.
+interface is the main interface used to advertise prefixes.

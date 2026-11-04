@@ -14,16 +14,26 @@ package speakerlist
 
 import (
 	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"go.universe.tf/metallb/internal/k8s"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/hashicorp/memberlist"
 )
+
+// SpeakerListInfo contains information about available speaker nodes.
+type SpeakerListInfo struct {
+	Nodes map[string]bool
+	// Disabled true indicates that the memberlist protocol is off
+	Disabled bool
+}
 
 // SpeakerList represents a list of healthy speakers.
 type SpeakerList struct {
@@ -33,6 +43,7 @@ type SpeakerList struct {
 	namespace string
 	labels    string
 
+	disabled bool
 	// The following fields are nil when memberlist is disabled.
 	mlEventCh chan memberlist.NodeEvent
 	ml        *memberlist.Memberlist
@@ -43,7 +54,7 @@ type SpeakerList struct {
 }
 
 // New creates a new SpeakerList and returns a pointer to it.
-func New(logger log.Logger, nodeName, bindAddr, bindPort, secret, namespace, labels string, stopCh chan struct{}) (*SpeakerList, error) {
+func New(logger log.Logger, nodeName, bindAddr, bindPort, secret, namespace, labels string, WANNetwork bool, stopCh chan struct{}) (*SpeakerList, error) {
 	sl := SpeakerList{
 		l:         logger,
 		stopCh:    stopCh,
@@ -53,30 +64,43 @@ func New(logger log.Logger, nodeName, bindAddr, bindPort, secret, namespace, lab
 
 	if labels == "" || bindAddr == "" {
 		level.Info(logger).Log("op", "startup", "msg", "not starting fast dead node detection (memberlist), need ml-bindaddr / ml-labels config")
+		level.Info(logger).Log("op", "startup", "msg", "when memberlist is disabled, the speaker pods must run on all nodes")
+		sl.disabled = true
 		return &sl, nil
 	}
 
-	mconfig := memberlist.DefaultLANConfig()
+	memberListConfig := memberlist.DefaultLANConfig()
+	if WANNetwork {
+		memberListConfig = memberlist.DefaultWANConfig()
+	}
 
-	// mconfig.Name MUST be equal to the spec.nodeName field of the speaker pod as we match it
+	loadedConfig, err := tryToLoadMemberListConfig(memberlistConfigPath, logger)
+	if err != nil && !os.IsNotExist(err) {
+		level.Error(logger).Log("op", "startup", "error", err, "msg", "failed to load memberlist config")
+		return nil, err
+	}
+	if err == nil {
+		memberListConfig = loadedConfig
+	}
+
+	// memberListConfig.Name MUST be equal to the spec.nodeName field of the speaker pod as we match it
 	// against the nodeName field of Endpoint objects inside usableNodes().
-	mconfig.Name = nodeName
-	mconfig.BindAddr = bindAddr
+	memberListConfig.Name = nodeName
+	memberListConfig.BindAddr = bindAddr
 	if bindPort != "" {
 		mlport, err := strconv.Atoi(bindPort)
 		if err != nil {
 			level.Error(logger).Log("op", "startup", "error", "unable to parse ml-bindport", "msg", err)
 			return nil, err
 		}
-		mconfig.BindPort = mlport
-		mconfig.AdvertisePort = mlport
+		memberListConfig.BindPort = mlport
+		memberListConfig.AdvertisePort = mlport
 	}
-	mconfig.Logger = newMemberlistLogger(sl.l)
+	memberListConfig.Logger = newMemberlistLogger(sl.l)
 	if secret == "" {
 		level.Warn(logger).Log("op", "startup", "warning", "no ml-secret-key set, memberlist traffic will not be encrypted")
 	} else {
-		sha := sha256.New()
-		mconfig.SecretKey = sha.Sum([]byte(secret))[:16]
+		memberListConfig.SecretKey = secretKeyFor(secret)
 	}
 
 	// This channel is used by the Rejoin() method which runs on k8s node
@@ -88,9 +112,9 @@ func New(logger log.Logger, nodeName, bindAddr, bindPort, secret, namespace, lab
 	// 'big'.
 	// TODO: See https://github.com/metallb/metallb/issues/716
 	sl.mlEventCh = make(chan memberlist.NodeEvent, 1024)
-	mconfig.Events = &memberlist.ChannelEventDelegate{Ch: sl.mlEventCh}
+	memberListConfig.Events = &memberlist.ChannelEventDelegate{Ch: sl.mlEventCh}
 
-	ml, err := memberlist.Create(mconfig)
+	ml, err := memberlist.Create(memberListConfig)
 	if err != nil {
 		level.Error(logger).Log("op", "startup", "error", err, "msg", "failed to create memberlist")
 		return nil, err
@@ -99,6 +123,12 @@ func New(logger log.Logger, nodeName, bindAddr, bindPort, secret, namespace, lab
 	sl.ml = ml
 
 	return &sl, nil
+}
+
+// secretKeyFor derives memberlist's 32 byte AES key from the configured secret.
+func secretKeyFor(secret string) []byte {
+	key := sha256.Sum256([]byte(secret))
+	return key[:]
 }
 
 // Start initializes the SpeakerList. This functions must be called before using
@@ -255,7 +285,7 @@ func (sl *SpeakerList) mlJoin() {
 	if err != nil || nr != len(joinIPs) {
 		level.Error(sl.l).Log("op", "memberDiscovery", "msg", "partial join", "joined", nr, "expected", len(joinIPs), "error", err)
 	} else {
-		level.Info(sl.l).Log("op", "Member detection", "msg", "memberlist join succesfully", "number of other nodes", nr)
+		level.Info(sl.l).Log("op", "Member detection", "msg", "memberlist join successfully", "number of other nodes", nr)
 	}
 }
 
@@ -275,15 +305,23 @@ func (sl *SpeakerList) Rejoin() {
 }
 
 // UsableSpeakers returns a map of usable speaker nodes.
-func (sl *SpeakerList) UsableSpeakers() map[string]bool {
+func (sl *SpeakerList) UsableSpeakers() SpeakerListInfo {
 	if sl.ml == nil {
-		return nil
+		return SpeakerListInfo{
+			Nodes:    nil,
+			Disabled: true,
+		}
 	}
+
 	activeNodes := map[string]bool{}
 	for _, n := range sl.ml.Members() {
 		activeNodes[n.Name] = true
 	}
-	return activeNodes
+
+	return SpeakerListInfo{
+		Nodes:    activeNodes,
+		Disabled: false,
+	}
 }
 
 // Stop stops the SpeakerList.
@@ -313,4 +351,87 @@ func (sl *SpeakerList) memberlistWatchEvents() {
 			return
 		}
 	}
+}
+
+// memberlistConfigPath is the well-known path where an optional memberlist
+// configuration file may be mounted (e.g. from a ConfigMap).
+const memberlistConfigPath = "/etc/metallb/memberlist/config.json"
+
+// memberlistFileConfig is the complete set of memberlist.Config fields exposed
+// for external configuration via a ConfigMap file. All fields are required when
+// the file is present — omitting a field is an error. Duration values must use
+// Go duration string format (e.g. "5s", "200ms").
+type memberlistFileConfig struct {
+	TCPTimeout              string `json:"TCPTimeout"`
+	IndirectChecks          int    `json:"IndirectChecks"`
+	RetransmitMult          int    `json:"RetransmitMult"`
+	SuspicionMult           int    `json:"SuspicionMult"`
+	SuspicionMaxTimeoutMult int    `json:"SuspicionMaxTimeoutMult"`
+	PushPullInterval        string `json:"PushPullInterval"`
+	ProbeTimeout            string `json:"ProbeTimeout"`
+	ProbeInterval           string `json:"ProbeInterval"`
+	DisableTcpPings         bool   `json:"DisableTcpPings"`
+	AwarenessMaxMultiplier  int    `json:"AwarenessMaxMultiplier"`
+	GossipNodes             int    `json:"GossipNodes"`
+	GossipInterval          string `json:"GossipInterval"`
+	GossipToTheDeadTime     string `json:"GossipToTheDeadTime"`
+	GossipVerifyIncoming    bool   `json:"GossipVerifyIncoming"`
+	GossipVerifyOutgoing    bool   `json:"GossipVerifyOutgoing"`
+	EnableCompression       bool   `json:"EnableCompression"`
+	HandoffQueueDepth       int    `json:"HandoffQueueDepth"`
+	UDPBufferSize           int    `json:"UDPBufferSize"`
+	QueueCheckInterval      string `json:"QueueCheckInterval"`
+}
+
+// tryToLoadMemberListConfig attempts to load memberlist configuration from the
+// given path. Returns the parsed config on success, or an error if reading or
+// parsing fails.
+func tryToLoadMemberListConfig(path string, logger log.Logger) (*memberlist.Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	level.Info(logger).Log("op", "startup", "msg", "loading memberlist config from file", "path", path)
+
+	var fc memberlistFileConfig
+	if err := json.Unmarshal(data, &fc); err != nil {
+		return nil, fmt.Errorf("parsing memberlist config file %s: %w", path, err)
+	}
+
+	cfg := memberlist.DefaultLANConfig()
+	cfg.IndirectChecks = fc.IndirectChecks
+	cfg.RetransmitMult = fc.RetransmitMult
+	cfg.SuspicionMult = fc.SuspicionMult
+	cfg.SuspicionMaxTimeoutMult = fc.SuspicionMaxTimeoutMult
+	cfg.GossipNodes = fc.GossipNodes
+	cfg.AwarenessMaxMultiplier = fc.AwarenessMaxMultiplier
+	cfg.HandoffQueueDepth = fc.HandoffQueueDepth
+	cfg.UDPBufferSize = fc.UDPBufferSize
+	cfg.DisableTcpPings = fc.DisableTcpPings
+	cfg.GossipVerifyIncoming = fc.GossipVerifyIncoming
+	cfg.GossipVerifyOutgoing = fc.GossipVerifyOutgoing
+	cfg.EnableCompression = fc.EnableCompression
+
+	for _, item := range []struct {
+		dst *time.Duration
+		src string
+		key string
+	}{
+		{&cfg.TCPTimeout, fc.TCPTimeout, "TCPTimeout"},
+		{&cfg.PushPullInterval, fc.PushPullInterval, "PushPullInterval"},
+		{&cfg.ProbeTimeout, fc.ProbeTimeout, "ProbeTimeout"},
+		{&cfg.ProbeInterval, fc.ProbeInterval, "ProbeInterval"},
+		{&cfg.GossipInterval, fc.GossipInterval, "GossipInterval"},
+		{&cfg.GossipToTheDeadTime, fc.GossipToTheDeadTime, "GossipToTheDeadTime"},
+		{&cfg.QueueCheckInterval, fc.QueueCheckInterval, "QueueCheckInterval"},
+	} {
+		d, err := time.ParseDuration(item.src)
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s %q in memberlist config file: %w", item.key, item.src, err)
+		}
+		*item.dst = d
+	}
+
+	return cfg, nil
 }

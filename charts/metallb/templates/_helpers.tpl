@@ -74,15 +74,26 @@ Create the name of the speaker service account to use
 {{- end }}
 
 {{/*
-Create the name of the settings ConfigMap to use.
-*/}}
-{{- define "metallb.configMapName" -}}
-{{ default ( printf "%s" (include "metallb.fullname" .) ) .Values.existingConfigMap | trunc 63 | trimSuffix "-" }}
-{{- end -}}
-
-{{/*
 Create the name of the settings Secret to use.
 */}}
 {{- define "metallb.secretName" -}}
     {{ default ( printf "%s-memberlist" (include "metallb.fullname" .)) .Values.speaker.secretName | trunc 63 | trimSuffix "-" }}
 {{- end -}}
+
+{{- define "metrics.exposedportname" -}}
+"metricshttps"
+{{- end -}}
+
+{{- define "metrics.exposedfrrportname" -}}
+"frrmetricshttps"
+{{- end }}
+
+{{- define "metrics.exposedport" -}}
+{{ .Values.prometheus.metricsPort }}
+{{- end }}
+
+{{- define "metrics.exposedfrrport" -}}
+{{ .Values.speaker.frr.metricsPort }}
+{{- end }}
+
+

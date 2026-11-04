@@ -56,12 +56,33 @@ kubectl apply -f - -n kube-system
 
 ## Installation by manifest
 
-To install MetalLB, apply the manifest:
+MetalLB offers different manifests depending on which BGP backend you need.
+Choose the one that fits your deployment:
+
+**FRR-K8s mode (recommended)** -- includes the [FRR-K8s]({{% relref "concepts/bgp.md" %}}#frr-k8s-mode) backend,
+which provides BGP with BFD support, IPv6, and the ability to merge additional FRR configuration:
 
 ```bash
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/namespace.yaml
-kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/manifests/metallb.yaml
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/config/manifests/metallb-frr-k8s.yaml
 ```
+
+**Native mode** -- a lightweight deployment with the built-in native BGP implementation
+(no BFD, no IPv6 BGP). Suitable for L2-only or simple BGP setups:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/config/manifests/metallb-native.yaml
+```
+
+**FRR mode (deprecated)** -- configures [FRR directly]({{% relref "concepts/bgp.md" %}}#frr-mode-deprecated)
+without the FRR-K8s layer. Migrate to FRR-K8s mode instead:
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/main/config/manifests/metallb-frr.yaml
+```
+
+{{% notice note %}}
+These manifests deploy MetalLB from the main development branch. We highly encourage cloud operators to deploy a stable released version of MetalLB on production environments!
+{{% /notice %}}
 
 This will deploy MetalLB to your cluster, under the `metallb-system`
 namespace. The components in the manifest are:
@@ -76,52 +97,66 @@ namespace. The components in the manifest are:
 
 The installation manifest does not include a configuration
 file. MetalLB's components will still start, but will remain idle
-until
-you
-[define and deploy a configmap]({{% relref "../configuration/_index.md" %}}).
+until you [start deploying resources]({{% relref "../configuration/_index.md" %}}).
+
+There are also two all-in-one manifests to allow the integration with prometheus. They assume that the
+prometheus operator is deployed in the `monitoring` namespace using the `prometheus-k8s`
+service account. It is suggested to use either the charts or kustomize if they
+need to be changed.
+
+{{% notice note %}}
+
+You may notice the "prometheus" variants of the manifests (for example `https://raw.githubusercontent.com/metallb/metallb/main/config/manifests/metallb-native-prometheus.yaml`).
+Those manifests rely on a very specific way of deploying Prometheus via the [kube prometheus](https://github.com/prometheus-operator/kube-prometheus) repository, and
+are mainly used by our CI, but they might not be compatible to your Prometheus deployment.
+
+{{% /notice %}}
+
+The Prometheus manifests do not include MetalLB alert rules. The Helm chart can create the built-in rules as a `PrometheusRule` when
+[`prometheus.prometheusRule.enabled`](https://github.com/metallb/metallb/blob/main/charts/metallb/values.yaml) is set to `true`; it defaults to `false`.
+This resource requires the Prometheus Operator's `PrometheusRule` custom resource definition. For a manifest-based installation, create your own
+`PrometheusRule` or adapt the [chart's rule template](https://github.com/metallb/metallb/blob/main/charts/metallb/templates/prometheusrules.yaml).
 
 ## Installation with kustomize
 
 You can install MetalLB with
 [Kustomize](https://github.com/kubernetes-sigs/kustomize) by pointing
-at the remote kustomization file :
+at the remote kustomization file.
+
+To deploy with the [FRR-K8s mode]({{% relref "concepts/bgp.md" %}}#frr-k8s-mode) (recommended):
 
 ```yaml
 # kustomization.yml
 namespace: metallb-system
 
 resources:
-  - github.com/metallb/metallb//manifests?ref=v0.9.3
-  - configmap.yml 
+  - github.com/metallb/metallb/config/frr-k8s?ref=main
 ```
 
-If you want to use a
-[configMapGenerator](https://github.com/kubernetes-sigs/kustomize/blob/master/examples/configGeneration.md)
-for config file, you want to tell Kustomize not to append a hash to
-the config map, as MetalLB is waiting for a config map named `config`
-(see
-<https://github.com/kubernetes-sigs/kustomize/blob/master/examples/generatorOptions.md>):
+To deploy with the native BGP implementation:
 
 ```yaml
 # kustomization.yml
 namespace: metallb-system
 
 resources:
-  - github.com/metallb/metallb//manifests?ref=v0.9.3
+  - github.com/metallb/metallb/config/native?ref=main
+```
 
-configMapGenerator:
-- name: config
-  files:
-    - configs/config
+To deploy with the [FRR mode]({{% relref "concepts/bgp.md" %}}#frr-mode-deprecated) (**deprecated**):
 
-generatorOptions:
- disableNameSuffixHash: true
+```yaml
+# kustomization.yml
+namespace: metallb-system
+
+resources:
+  - github.com/metallb/metallb/config/frr?ref=main
 ```
 
 ## Installation with Helm
 
-You can install MetallLB with [Helm](https://helm.sh/)
-by using the Helm chart repository: <https://metallb.github.io/metallb>
+You can install MetalLB with [Helm](https://helm.sh/)
+by using the Helm chart repository: `https://metallb.github.io/metallb`
 
 ```bash
 helm repo add metallb https://metallb.github.io/metallb
@@ -134,27 +169,132 @@ A values file may be specified on installation. This is recommended for providin
 helm install metallb metallb/metallb -f values.yaml
 ```
 
-MetalLB configs are set in `values.yaml` under `configInLine`:
+{{% notice note %}}
+The speaker pod requires elevated permission in order to perform its network functionalities.
+
+If you are using MetalLB with a kubernetes version that enforces [pod security admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/) (which is beta in k8s
+1.23), the namespace MetalLB is deployed to must be labelled with:
 
 ```yaml
-configInline:
-  address-pools:
-   - name: default
-     protocol: layer2
-     addresses:
-     - 198.51.100.0/24
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
 ```
+
+{{% /notice %}}
+
+{{% notice note %}}
+By default, the Helm chart deploys MetalLB using the [FRR-K8s mode]({{% relref "concepts/bgp.md" %}}#frr-k8s-mode).
+
+If you want to deploy MetalLB using the [FRR mode]({{% relref "concepts/bgp.md" %}}#frr-mode-deprecated) instead (**deprecated**), the following values must be set:
+
+```yaml
+speaker:
+  frr:
+    enabled: true
+frrk8s:
+  enabled: false
+```
+
+If you want to deploy MetalLB using the native BGP implementation (without FRR), the following values must be set:
+
+```yaml
+speaker:
+  frr:
+    enabled: false
+frrk8s:
+  enabled: false
+```
+
+{{% /notice %}}
+
+## Using the MetalLB Operator
+
+The MetalLB Operator is available on OperatorHub at [operatorhub.io/operator/metallb-operator](https://operatorhub.io/operator/metallb-operator). It eases the deployment and life-cycle of MetalLB in a cluster and allows configuring MetalLB via CRDs.
+
+{{% notice note %}}
+The recommended BGP backend is [FRR-K8s mode]({{% relref "concepts/bgp.md" %}}#frr-k8s-mode). To enable it
+via the Operator, edit the ClusterServiceVersion resource named `metallb-operator`:
+
+```bash
+kubectl edit csv metallb-operator
+```
+
+and set the `METALLB_BGP_TYPE` environment variable of the `manager` container to `frr-k8s`:
+
+```yaml
+- name: METALLB_BGP_TYPE
+  value: frr-k8s
+```
+
+The [FRR mode]({{% relref "concepts/bgp.md" %}}#frr-mode-deprecated) is **deprecated**. If you are
+currently using it via the Operator, plan to migrate to `frr-k8s`:
+
+```yaml
+- name: METALLB_BGP_TYPE
+  value: frr-k8s
+```
+
+{{% /notice %}}
+
+## FRR daemons logging level
+
+The FRR daemons logging level are configured using the speaker `--log-level` argument following the below mapping:
+
+Speaker log level | FRR log level
+------------------|--------------
+all, debug        | debugging
+info              | informational
+warn              | warnings
+error             | error
+none              | emergencies
+
+To override this behavior, you can set the `FRR_LOGGING_LEVEL` speaker's environment to any [FRR supported value](https://docs.frrouting.org/en/latest/basic.html#clicmd-log-stdout-LEVEL).
 
 ## Upgrade
 
-When upgrading MetalLB, always check the [release notes](https://metallb.universe.tf/release-notes/)
+When upgrading MetalLB, always check the [release notes](https://metallb.io/release-notes/)
 to see the changes and required actions, if any. Pay special attention to the release notes when
 upgrading to newer major/minor releases.
 
-Unless specified otherwise in the release notes, upgrade MetalLB either using
-[plain manifests](#installation-by-manifest) or using [Kustomize](#installation-with-kustomize) as
-described above.
+Unless specified otherwise in the release notes, upgrade MetalLB using one of the
+methods described above:
 
-Please take the known limitations for [layer2](https://metallb.universe.tf/concepts/layer2/#limitations)
-and [bgp](https://metallb.universe.tf/concepts/bgp/#limitations) into account when performing an
+- [Plain manifests](#installation-by-manifest)
+- [Kustomize](#installation-with-kustomize)
+- [Helm](#installation-with-helm)
+
+When upgrading via Helm, note that the chart is designed to automatically upgrade the CRDs;
+there is no need to upgrade them manually.
+
+{{% notice warning %}}
+**Default BGP mode change**: The Helm chart default has changed from **FRR mode** to **FRR-K8s mode**.
+If you were relying on the chart defaults (without explicitly setting `speaker.frr.enabled: true`),
+upgrading will switch your BGP backend from FRR to FRR-K8s. This changes the pod topology (FRR-K8s
+runs as a separate DaemonSet instead of a sidecar) and the Prometheus metric prefix (from `metallb_`
+to `frrk8s_`). To keep FRR mode during upgrade, pin your values explicitly:
+
+```yaml
+speaker:
+  frr:
+    enabled: true
+frrk8s:
+  enabled: false
+```
+
+See the [Prometheus metrics]({{% relref "prometheus-metrics/_index.md" %}}) page for guidance on
+metric relabeling for backward compatibility.
+{{% /notice %}}
+
+Please take the known limitations for [layer2](https://metallb.io/concepts/layer2/#limitations)
+and [bgp](https://metallb.io/concepts/bgp/#limitations) into account when performing an
 upgrade.
+
+## Setting the LoadBalancer Class
+
+MetalLB supports [LoadBalancerClass](https://kubernetes.io/docs/concepts/services-networking/service/#load-balancer-class),
+which allows multiple load balancer implementations to co-exist. In order to set the loadbalancer class MetalLB should be listening
+for, the `--lb-class=<CLASS_NAME>` parameter must be provided to both the speaker and the controller.
+
+The helm charts support it via the `loadBalancerClass` parameter.

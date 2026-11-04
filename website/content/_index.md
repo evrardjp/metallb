@@ -2,14 +2,14 @@
 title: MetalLB
 ---
 
-# MetalLB
-
 MetalLB is a load-balancer implementation for bare
 metal [Kubernetes](https://kubernetes.io) clusters, using standard
 routing protocols.
 
 {{% notice note %}}
-MetalLB is a young project. You should treat it as a **beta** system.
+Despite the beta status of the project / API, MetalLB is known to be
+stable and reliable.
+
 The [project maturity]({{% relref "concepts/maturity.md" %}}) page
 explains what that implies.
 {{% /notice %}}
@@ -48,8 +48,14 @@ MetalLB requires the following to function:
 - Some IPv4 addresses for MetalLB to hand out.
 - When using the BGP operating mode, you will need one or more routers
   capable of speaking [BGP](https://en.wikipedia.org/wiki/Border_Gateway_Protocol).
-- Traffic on port 7946 (TCP & UDP) must be allowed between nodes, as required by
+- When using the L2 operating mode, traffic on port 7946 (TCP & UDP, other port can be configured) must be allowed between nodes, as required by
   [memberlist](https://github.com/hashicorp/memberlist).
+
+## Backward Compatibility
+
+Previous versions of MetalLB are configurable via a `configmap`. However, starting from the version
+`v0.13.0`, it will be possible to configure it only via CRs. [A tool to convert]({{% relref "configuration/migration_to_crds.md" %}}) old configmaps to CRs
+is provided as a container image under `quay.io/metallb/configmaptocrs`.
 
 ## Usage
 
@@ -58,6 +64,14 @@ you a primer on what MetalLB does in your cluster. When you're ready
 to deploy to a Kubernetes cluster, head to the
 [installation](/installation/) and [usage]({{% relref
 "usage/_index.md" %}}) guides.
+
+## FRR-K8s Mode
+
+MetalLB uses [FRR-K8s](https://github.com/metallb/frr-k8s) as the default backend for handling BGP sessions. FRR-K8s is a Kubernetes wrapper around [FRR](https://frrouting.org/) with its own API, allowing additional FRR configuration to be provided alongside MetalLB's while sharing the same BGP sessions.
+
+It provides features that are not available with the native BGP implementation, such as pairing BGP sessions with BFD sessions and advertising IPv6 addresses.
+
+An alternative [FRR mode]({{% relref "concepts/bgp.md" %}}#frr-mode-deprecated) that configures FRR directly (without the FRR-K8s layer) is also available but **deprecated**. Please see the [installation](https://metallb.io/installation/) section for instructions on how to switch between modes.
 
 ## Contributing
 
@@ -71,4 +85,5 @@ to
 which will give us warm fuzzy feelings :).
 
 We are a [Cloud Native Computing Foundation](https://cncf.io/) sandbox project.
+
 ![cncf](/images/cncf-color.png)

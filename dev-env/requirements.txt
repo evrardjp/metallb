@@ -2,3 +2,5 @@
 invoke
 semver
 PyYAML
+black>=26.1
+Jinja2

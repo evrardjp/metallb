@@ -1,3 +1,5 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package k8salloc
 
 import (
@@ -16,11 +18,6 @@ func Ports(svc *v1.Service) []allocator.Port {
 		})
 	}
 	return ret
-}
-
-// SharingKey extracts the sharing key for a service.
-func SharingKey(svc *v1.Service) string {
-	return svc.Annotations["metallb.universe.tf/allow-shared-ip"]
 }
 
 // BackendKey extracts the backend key for a service.

@@ -1,0 +1,11 @@
+# DEPRECATED: The FRR mode is deprecated and will be removed in a future release.
+# Please use config/frr-k8s instead, which is now the default BGP backend.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- ../native
+- frr-cm.yaml
+patchesStrategicMerge:
+- speaker-patch.yaml
+- controller-patch.yaml
+namespace: metallb-system

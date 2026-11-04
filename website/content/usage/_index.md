@@ -20,10 +20,32 @@ address, or if the address is already in use by another service,
 assignment will fail and MetalLB will log a warning event visible in
 `kubectl describe service <service name>`.
 
+MetalLB supports `spec.loadBalancerIP` and a custom `metallb.io/loadBalancerIPs`
+annotation. The annotation also supports a comma separated list of IPs to be used in case of
+Dual Stack services.
+
+Please note that `spec.LoadBalancerIP` is planned to be deprecated in [k8s apis](https://github.com/kubernetes/kubernetes/pull/107235).
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  annotations:
+    metallb.io/loadBalancerIPs: 192.168.1.100
+spec:
+  ports:
+  - port: 80
+    targetPort: 80
+  selector:
+    app: nginx
+  type: LoadBalancer
+```
+
 MetalLB also supports requesting a specific address pool, if you want
 a certain kind of address but don't care which one exactly. To request
 assignment from a specific pool, add the
-`metallb.universe.tf/address-pool` annotation to your service, with the
+`metallb.io/address-pool` annotation to your service, with the
 name of the address pool as the annotation value. For example:
 
 ```yaml
@@ -32,7 +54,7 @@ kind: Service
 metadata:
   name: nginx
   annotations:
-    metallb.universe.tf/address-pool: production-public-ips
+    metallb.io/address-pool: production-public-ips
 spec:
   ports:
   - port: 80
@@ -149,11 +171,23 @@ announcements. See
 [issue 1](https://github.com/metallb/metallb/issues/1) for more
 information.
 
+## IPv6 and dual stack services
+
+IPv6 and dual stack services are supported in L2 mode, and in BGP mode only
+via the FRR-based modes (FRR-K8s or FRR).
+
+In order for MetalLB to allocate IPs to a dual stack service, there must be
+at least one address pool having both addresses of version v4 and v6.
+
+Note that in case of dual stack services, it is not possible to use
+`spec.loadBalancerIP` as it does not allow to request for multiple IPs,
+so the annotation `metallb.io/loadBalancerIPs` must be used.
+
 ## IP address sharing
 
 By default, Services do not share IP addresses. If you have a need to
 colocate services on a single IP, you can enable selective IP sharing
-by adding the `metallb.universe.tf/allow-shared-ip` annotation to
+by adding the `metallb.io/allow-shared-ip` annotation to
 services.
 
 The value of the annotation is a "sharing key." Services can share an
@@ -174,15 +208,51 @@ There are two main reasons to colocate services in this fashion: to
 work around a Kubernetes limitation, and to work with limited IP
 addresses.
 
-[Kubernetes does not currently allow multiprotocol LoadBalancer services](https://github.com/kubernetes/kubernetes/issues/23880). This
-would normally make it impossible to run services like DNS, because
-they have to listen on both TCP and UDP. To work around this
-limitation of Kubernetes with MetalLB, create two services (one for
-TCP, one for UDP), both with the same pod selector. Then, give them
-the same sharing key and `spec.loadBalancerIP` to colocate the TCP and
-UDP serving ports on the same IP address.
+{{% notice warning %}}
+In L2 mode, `allow-shared-ip` is incompatible with `serviceSelectors` on L2Advertisements. Services using `allow-shared-ip` that match an L2Advertisement with `serviceSelectors` will not be announced.
+{{% /notice %}}
 
-The second reason is much simpler: if you have more services than
+Here is an example configuration of two services that share the same ip address:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-service-tcp
+  namespace: default
+  annotations:
+    metallb.io/allow-shared-ip: "key-to-share-1.2.3.4"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 1.2.3.4
+  ports:
+    - name: dnstcp
+      protocol: TCP
+      port: 53
+      targetPort: 53
+  selector:
+    app: dns
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-service-udp
+  namespace: default
+  annotations:
+    metallb.io/allow-shared-ip: "key-to-share-1.2.3.4"
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 1.2.3.4
+  ports:
+    - name: dnsudp
+      protocol: UDP
+      port: 53
+      targetPort: 53
+  selector:
+    app: dns
+```
+
+This might be useful in case you have more services than
 available IP addresses, and you can't or don't want to get more
 addresses, the only alternative is to colocate multiple services per
 IP address.

@@ -13,25 +13,23 @@ platform isn't listed here, its support status is unknown, but it's
 very likely that the answer is "no". If you know for sure, please send
 a pull request to update this list!
 
-Cloud platform | Supported
----------------|---------------------------
-AWS            | No, use EKS
-Azure          | No, use AKS
-DigitalOcean   | No, use DigitalOcean Kubernetes
-Equinix Metal  | Yes, see [Equinix Metal notes]
-Google Cloud   | No, use GKE
-Hetzner        | Yes, see [Hetzner notes](https://community.hetzner.com/tutorials/install-kubernetes-cluster)
-OVH            | Yes, when using a vRack
-OpenShift OCP  | Yes, see [OpenShift notes]
-OpenStack      | Yes, see [OpenStack notes]
-Proxmox        | Yes
-VMware         | Yes
-Vultr          | Yes
+| Cloud platform | Supported                                                                                    |
+|----------------|----------------------------------------------------------------------------------------------|
+| AWS            | No, use EKS                                                                                  |
+| Azure          | No, use AKS                                                                                  |
+| DigitalOcean   | No, use DigitalOcean Kubernetes                                                              |
+| Google Cloud   | No, use GKE                                                                                  |
+| Hetzner        | Yes, see [Hetzner notes](https://community.hetzner.com/tutorials/install-kubernetes-cluster) |
+| OVH            | Yes, when using a vRack                                                                      |
+| OpenShift OCP  | Yes, see [OpenShift notes]                                                                   |
+| OpenStack      | Yes, see [OpenStack notes]                                                                   |
+| Proxmox        | Yes                                                                                          |
+| VMware         | Yes                                                                                          |
+| Vultr          | Yes                                                                                          |
 
 [use alternatives]: #alternatives
 [OpenShift notes]: #metallb-on-openshift-ocp
 [OpenStack notes]: #metallb-on-openstack
-[Equinix Metal notes]: #metallb-on-equinix-metal
 
 ## Why doesn't MetalLB work on (most) cloud platforms?
 
@@ -73,6 +71,9 @@ range, so you have to remove the hardcoded unprivileged UID from the
 MetalLB manifests. You can do this by removing the
 `spec.template.spec.securityContext.runAsUser` field from both the
 `controller` Deployment and the `speaker` DaemonSet.
+Also, as the allowed group ID range in Openshift is 5000 through 5999,
+you have to remove `spec.template.spec.securityContext.fsGroup` field
+as well.
 
 Additionally, you have to grant the `speaker` DaemonSet elevated
 privileges, so that it can do the raw networking required to make
@@ -81,6 +82,9 @@ load balancers work. You can do this with:
 ```bash
 oc adm policy add-scc-to-user privileged -n metallb-system -z speaker
 ```
+
+Please note that if you are deploying MetalLB via helm, the ServiceAccount
+name is metallb-speaker.
 
 After that, MetalLB should work normally.
 
@@ -96,15 +100,6 @@ OpenStack, because we're announcing IP addresses that OpenStack
 doesn't know about. There's currently no way to make OpenStack
 cooperate with MetalLB here, so we have to turn off the spoofing
 protection entirely.
-
-### MetalLB on Equinix Metal
-
-[Equinix Metal](https://metal.equinix.com) is an unusually "bare metal" cloud
-platform, and supports using BGP to advertise and route floating IPs to
-machines. As such, MetalLB's BGP mode works great on Equinix Metal! There is
-even a [tutorial](https://github.com/packet-labs/kubernetes-bgp) written by the
-folks at Equinix Metal, that use MetalLB to integrate Kubernetes load balancers
-with their BGP infrastructure.
 
 ## Alternatives
 

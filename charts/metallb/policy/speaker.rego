@@ -3,36 +3,24 @@ package main
 # validate serviceAccountName
 deny[msg] {
   input.kind == "DaemonSet"
+  endswith(input.metadata.name, "-speaker")
   serviceAccountName := input.spec.template.spec.serviceAccountName
-  not serviceAccountName == "RELEASE-NAME-metallb-speaker"
+  not serviceAccountName == "release-name-metallb-speaker"
   msg = sprintf("speaker serviceAccountName '%s' does not match expected value", [serviceAccountName])
-}
-
-# validate config map name in container args
-deny[msg] {
-  input.kind == "DaemonSet"
-  configArg := input.spec.template.spec.containers[0].args[1]
-  not configArg == "--config=RELEASE-NAME-metallb"
-  msg = sprintf("speaker ConfigMap arg '%s' does not match expected value", [configArg])
 }
 
 # validate METALLB_ML_SECRET_KEY (memberlist)
 deny[msg] {
 	input.kind == "DaemonSet"
-	not input.spec.template.spec.containers[0].env[5].name == "METALLB_ML_SECRET_KEY"
-	msg = "speaker env does not contain METALLB_ML_SECRET_KEY at env[5]"
-}
-
-deny[msg] {
-	input.kind == "DaemonSet"
-	not input.spec.template.spec.containers[0].env[5].valueFrom.secretKeyRef.name == "RELEASE-NAME-metallb-memberlist"
-	not input.spec.template.spec.containers[0].env[5].valueFrom.secretKeyRef.key == "secretkey"
-	msg = "speaker env METALLB_ML_SECRET_KEY secretKeyRef does not equal expected value"
+	endswith(input.metadata.name, "-speaker")
+	not input.spec.template.spec.containers[0].env[5].name == "METALLB_ML_SECRET_KEY_PATH"
+	msg = "speaker env does not contain METALLB_ML_SECRET_KEY_PATH at env[5]"
 }
 
 # validate node selector includes builtin when custom ones are provided
 deny[msg] {
   input.kind == "DaemonSet"
+  endswith(input.metadata.name, "-speaker")
   not input.spec.template.spec.nodeSelector["kubernetes.io/os"] == "linux"
   msg = "controller nodeSelector does not include '\"kubernetes.io/os\": linux'"
 }
@@ -40,6 +28,16 @@ deny[msg] {
 # validate tolerations include the builtins when custom ones are provided
 deny[msg] {
   input.kind == "DaemonSet"
+  endswith(input.metadata.name, "-speaker")
   not input.spec.template.spec.tolerations[0] == { "key": "node-role.kubernetes.io/master", "effect": "NoSchedule", "operator": "Exists" }
   msg = "controller tolerations does not include node-role.kubernetes.io/master:NoSchedule"
+}
+# validate exclude-L2 config is readable by a non-root speaker
+deny[msg] {
+  input.kind == "DaemonSet"
+  endswith(input.metadata.name, "-speaker")
+  volume := input.spec.template.spec.volumes[_]
+  volume.name == "metallb-excludel2"
+  not volume.configMap.defaultMode == 292
+  msg = "speaker metallb-excludel2 ConfigMap defaultMode must be 292"
 }

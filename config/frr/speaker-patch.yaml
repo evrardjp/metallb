@@ -1,0 +1,141 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: speaker
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: 'true'
+      labels:
+        app: metallb
+        component: speaker
+    spec:
+      volumes:
+        - name: frr-sockets
+          emptyDir: {}
+        - name: frr-startup
+          configMap:
+            name: frr-startup
+        - name: frr-conf
+          emptyDir: {}
+        - name: reloader
+          emptyDir: {}
+        - name: metrics
+          emptyDir: {}
+        - name: frr-tmp
+          emptyDir: {}
+        - name: frr-lib
+          emptyDir: {}
+        - name: frr-log
+          emptyDir: {}
+      initContainers:
+        # Copies the initial config files with the right permissions to the shared volume.
+        - name: cp-frr-files
+          securityContext:
+            runAsUser: 100
+            runAsGroup: 101
+          image: quay.io/frrouting/frr:10.5.3
+          command: ["/bin/sh", "-c", "cp -rLf /tmp/frr/* /etc/frr/"]
+          volumeMounts:
+            - name: frr-startup
+              mountPath: /tmp/frr
+            - name: frr-conf
+              mountPath: /etc/frr
+        # Copies the reloader to the shared volume between the speaker and reloader.
+        - name: cp-reloader
+          image: quay.io/metallb/speaker:main
+          command: ["/cp-tool","/frr-reloader.sh","/etc/frr_reloader/frr-reloader.sh"]
+          volumeMounts:
+            - name: reloader
+              mountPath: /etc/frr_reloader
+        # Copies the metrics exporter
+        - name: cp-metrics
+          image: quay.io/metallb/speaker:main
+          command: ["/cp-tool","/frr-metrics","/etc/frr_metrics/frr-metrics"]
+          volumeMounts:
+            - name: metrics
+              mountPath: /etc/frr_metrics
+      containers:
+        - name: frr
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW", "SYS_ADMIN", "NET_BIND_SERVICE"]
+          image: quay.io/frrouting/frr:10.5.3
+          env:
+            - name: TINI_SUBREAPER
+              value: "true"
+          volumeMounts:
+            - name: frr-sockets
+              mountPath: /var/run/frr
+            - name: frr-conf
+              mountPath: /etc/frr
+          command:
+            - /bin/sh
+            - -c
+            - /sbin/tini -- /usr/lib/frr/docker-start
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 9121
+              scheme: HTTPS
+            periodSeconds: 5
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: 9121
+              scheme: HTTPS
+            failureThreshold: 30
+            periodSeconds: 5
+        - name: reloader
+          image: quay.io/frrouting/frr:10.5.3
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          command: ["/etc/frr_reloader/frr-reloader.sh"]
+          volumeMounts:
+            - name: frr-sockets
+              mountPath: /var/run/frr
+            - name: frr-conf
+              mountPath: /etc/frr
+            - name: reloader
+              mountPath: /etc/frr_reloader
+            - name: frr-log
+              mountPath: /var/log/frr
+        - name: frr-metrics
+          image: quay.io/frrouting/frr:10.5.3
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          command: ["/etc/frr_metrics/frr-metrics"]
+          args:
+            - --metrics-port=9121
+            - --metrics-bind-address=0.0.0.0
+          env:
+            - name: VTYSH_HISTFILE
+              value: /dev/null
+          ports:
+            - containerPort: 9121
+              name: frrmetricshttps
+          volumeMounts:
+            - name: frr-sockets
+              mountPath: /var/run/frr
+            - name: frr-conf
+              mountPath: /etc/frr
+            - name: metrics
+              mountPath: /etc/frr_metrics
+        - name: speaker
+          env:
+            - name: FRR_CONFIG_FILE
+              value: /etc/frr_reloader/frr.conf
+            - name: FRR_RELOADER_PID_FILE
+              value: /etc/frr_reloader/reloader.pid
+            - name: METALLB_BGP_TYPE
+              value: frr
+          volumeMounts:
+            - name: reloader
+              mountPath: /etc/frr_reloader
+      shareProcessNamespace: true

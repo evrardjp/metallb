@@ -1,25 +1,38 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sort"
 	"testing"
 
 	"go.universe.tf/metallb/internal/config"
-	"go.universe.tf/metallb/internal/k8s"
+	"go.universe.tf/metallb/internal/k8s/controllers"
+	"go.universe.tf/metallb/internal/layer2"
+	"go.universe.tf/metallb/internal/speakerlist"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/utils/ptr"
 )
 
 type fakeSpeakerList struct {
 	speakers map[string]bool
 }
 
-func (sl *fakeSpeakerList) UsableSpeakers() map[string]bool {
-	return sl.speakers
+func (sl *fakeSpeakerList) UsableSpeakers() speakerlist.SpeakerListInfo {
+	return speakerlist.SpeakerListInfo{
+		Nodes:    sl.speakers,
+		Disabled: sl.speakers == nil,
+	}
 }
 
 func (sl *fakeSpeakerList) Rejoin() {}
@@ -39,113 +52,99 @@ func compareUseableNodesReturnedValue(a, b []string) bool {
 	return true
 }
 
-func TestUsableNodes(t *testing.T) {
-	c, err := newController(controllerConfig{
-		MyNode: "iris1",
-		Logger: log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+func TestUsableNodesEPSlicesWithSpeakerlistDisabled(t *testing.T) {
+	// Create a speaker response with a null list as expected when speaker is disabled
+	fakeSL := &fakeSpeakerList{
+		speakers: nil,
+	}
+	c1, err := newController(controllerConfig{
+		MyNode:  "iris1",
+		Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:   fakeSL,
+		bgpType: bgpNative,
 	})
 	if err != nil {
 		t.Fatalf("creating controller: %s", err)
 	}
-	c.client = &testK8S{t: t}
+	c1.client = &testK8S{t: t}
+	allNodes := map[string]*v1.Node{
+		"iris1": {},
+		"iris2": {},
+	}
 
-	tests := []struct {
-		desc string
-
-		eps k8s.EpsOrSlices
-
-		usableSpeakers map[string]bool
-
-		cExpectedResult []string
-	}{
+	advertisementsForNode := []*config.L2Advertisement{
 		{
-			desc: "Two endpoints, different hosts",
-			eps: k8s.EpsOrSlices{
-				EpVal: &v1.Endpoints{
-					Subsets: []v1.EndpointSubset{
-						{
-							Addresses: []v1.EndpointAddress{
-								{
-									IP:       "2.3.4.5",
-									NodeName: strptr("iris1"),
-								},
-								{
-									IP:       "2.3.4.15",
-									NodeName: strptr("iris2"),
-								},
-							},
-						},
-					},
-				},
-				Type: k8s.Eps,
+			Nodes: map[string]bool{
+				"iris1": true,
+				"iris2": true,
 			},
-			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
-			cExpectedResult: []string{"iris1", "iris2"},
-		},
-
-		{
-			desc: "Two endpoints, same host",
-			eps: k8s.EpsOrSlices{
-				EpVal: &v1.Endpoints{
-					Subsets: []v1.EndpointSubset{
-						{
-							Addresses: []v1.EndpointAddress{
-								{
-									IP:       "2.3.4.5",
-									NodeName: strptr("iris1"),
-								},
-								{
-									IP:       "2.3.4.15",
-									NodeName: strptr("iris1"),
-								},
-							},
-						},
-					},
-				},
-				Type: k8s.Eps,
-			},
-			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
-			cExpectedResult: []string{"iris1"},
-		},
-
-		{
-			desc: "Two endpoints, same host, one is not ready",
-			eps: k8s.EpsOrSlices{
-				EpVal: &v1.Endpoints{
-					Subsets: []v1.EndpointSubset{
-						{
-							Addresses: []v1.EndpointAddress{
-								{
-									IP:       "2.3.4.5",
-									NodeName: strptr("iris1"),
-								},
-							},
-							NotReadyAddresses: []v1.EndpointAddress{
-								{
-									IP:       "2.3.4.15",
-									NodeName: strptr("iris1"),
-								},
-							},
-						},
-					},
-				},
-				Type: k8s.Eps,
-			},
-			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
-			cExpectedResult: []string{"iris1"},
 		},
 	}
 
-	for _, test := range tests {
-		response := usableNodes(test.eps, test.usableSpeakers)
-		sort.Strings(response)
-		if !compareUseableNodesReturnedValue(response, test.cExpectedResult) {
-			t.Errorf("%q: shouldAnnounce for controller returned incorrect result, expected '%s', but received '%s'", test.desc, test.cExpectedResult, response)
-		}
+	conf := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: advertisementsForNode,
+			},
+		}},
+	}
+
+	svc := &v1.Service{
+		Spec: v1.ServiceSpec{
+			Type:                  "LoadBalancer",
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+		},
+		Status: statusAssigned("10.20.30.1"),
+	}
+	eps := map[string][]discovery.EndpointSlice{
+		"10.20.30.1": {
+			{
+				Endpoints: []discovery.Endpoint{
+					{
+						Addresses: []string{
+							"2.3.4.5",
+						},
+						NodeName: ptr.To("iris1"),
+						Conditions: discovery.EndpointConditions{
+							Ready: ptr.To(true),
+						},
+					},
+					{
+						Addresses: []string{
+							"2.3.4.15",
+						},
+						NodeName: ptr.To("iris1"),
+						Conditions: discovery.EndpointConditions{
+							Ready: ptr.To(true),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	lbIP := net.ParseIP(svc.Status.LoadBalancer.Ingress[0].IP)
+	lbIPStr := lbIP.String()
+	l := log.NewNopLogger()
+	response := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l,
+		"test1",
+		[]net.IP{lbIP},
+		conf.Pools.ByName["default"],
+		svc,
+		eps[lbIPStr],
+		allNodes)
+	if response != "" {
+		t.Errorf("Expecting fallback when speakers list is not configured but got: %v", response)
 	}
 }
 
 func TestUsableNodesEPSlices(t *testing.T) {
+	b := &fakeBGP{
+		t: t,
+	}
+	newBGP = b.NewSessionManager
+
 	c, err := newController(controllerConfig{
 		MyNode: "iris1",
 		Logger: log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
@@ -158,7 +157,7 @@ func TestUsableNodesEPSlices(t *testing.T) {
 	tests := []struct {
 		desc string
 
-		eps k8s.EpsOrSlices
+		eps []discovery.EndpointSlice
 
 		usableSpeakers map[string]bool
 
@@ -166,112 +165,91 @@ func TestUsableNodesEPSlices(t *testing.T) {
 	}{
 		{
 			desc: "Two endpoints, different hosts, multi slice",
-			eps: k8s.EpsOrSlices{
-				SlicesVal: []*discovery.EndpointSlice{
-					{
-						Endpoints: []discovery.Endpoint{
-							{
-								Addresses: []string{
-									"2.3.4.5",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris1",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+			eps: []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
 							},
-						},
-					},
-					{
-						Endpoints: []discovery.Endpoint{
-							{
-								Addresses: []string{
-									"2.3.4.15",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris2",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
 							},
 						},
 					},
 				},
-				Type: k8s.Slices,
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.15",
+							},
+							NodeName: ptr.To("iris2"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
+							},
+						},
+					},
+				},
 			},
 			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
 			cExpectedResult: []string{"iris1", "iris2"},
 		},
 		{
 			desc: "Two endpoints, different hosts",
-			eps: k8s.EpsOrSlices{
-				SlicesVal: []*discovery.EndpointSlice{
-					{
-						Endpoints: []discovery.Endpoint{
-							{
-								Addresses: []string{
-									"2.3.4.5",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris1",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+			eps: []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
 							},
-							{
-								Addresses: []string{
-									"2.3.4.15",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris2",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
+							},
+						},
+						{
+							Addresses: []string{
+								"2.3.4.15",
+							},
+							NodeName: ptr.To("iris2"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
 							},
 						},
 					},
 				},
-				Type: k8s.Slices,
 			},
 			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
 			cExpectedResult: []string{"iris1", "iris2"},
 		},
 		{
 			desc: "Two endpoints, same host",
-			eps: k8s.EpsOrSlices{
-				SlicesVal: []*discovery.EndpointSlice{
-					{
-						Endpoints: []discovery.Endpoint{
-							{
-								Addresses: []string{
-									"2.3.4.5",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris1",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+			eps: []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
 							},
-							{
-								Addresses: []string{
-									"2.3.4.15",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris1",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
+							},
+						},
+						{
+							Addresses: []string{
+								"2.3.4.15",
+							},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
 							},
 						},
 					},
 				},
-				Type: k8s.Slices,
 			},
 			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
 			cExpectedResult: []string{"iris1"},
@@ -279,867 +257,102 @@ func TestUsableNodesEPSlices(t *testing.T) {
 
 		{
 			desc: "Two endpoints, same host, one is not ready",
-			eps: k8s.EpsOrSlices{
-				SlicesVal: []*discovery.EndpointSlice{
-					{
-						Endpoints: []discovery.Endpoint{
-							{
-								Addresses: []string{
-									"2.3.4.5",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris1",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(true),
-								},
+			eps: []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
 							},
-							{
-								Addresses: []string{
-									"2.3.4.15",
-								},
-								Topology: map[string]string{
-									"kubernetes.io/hostname": "iris1",
-								},
-								Conditions: discovery.EndpointConditions{
-									Ready: boolPtr(false),
-								},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
+							},
+						},
+						{
+							Addresses: []string{
+								"2.3.4.15",
+							},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(false),
 							},
 						},
 					},
 				},
-				Type: k8s.Slices,
 			},
 			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
 			cExpectedResult: []string{"iris1"},
 		},
+		{
+			desc: "Two endpoints, different hosts, not ready but serving",
+			eps: []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
+							},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready:   ptr.To(false),
+								Serving: ptr.To(true),
+							},
+						},
+						{
+							Addresses: []string{
+								"2.3.4.15",
+							},
+							NodeName: ptr.To("iris2"),
+							Conditions: discovery.EndpointConditions{
+								Ready:   ptr.To(false),
+								Serving: ptr.To(true),
+							},
+						},
+					},
+				},
+			},
+			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
+			cExpectedResult: []string{"iris1", "iris2"},
+		},
+		{
+			desc: "Two endpoints, different hosts, ready but not serving",
+			eps: []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
+							},
+							NodeName: ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{
+								Ready:   ptr.To(true),
+								Serving: ptr.To(false),
+							},
+						},
+						{
+							Addresses: []string{
+								"2.3.4.15",
+							},
+							NodeName: ptr.To("iris2"),
+							Conditions: discovery.EndpointConditions{
+								Ready:   ptr.To(true),
+								Serving: ptr.To(false),
+							},
+						},
+					},
+				},
+			},
+			usableSpeakers:  map[string]bool{"iris1": true, "iris2": true},
+			cExpectedResult: []string{"iris1", "iris2"},
+		},
 	}
 
 	for _, test := range tests {
-		response := usableNodes(test.eps, test.usableSpeakers)
+		response := nodesWithEndpoint(test.eps, test.usableSpeakers)
 		sort.Strings(response)
 		if !compareUseableNodesReturnedValue(response, test.cExpectedResult) {
 			t.Errorf("%q: shouldAnnounce for controller returned incorrect result, expected '%s', but received '%s'", test.desc, test.cExpectedResult, response)
-		}
-	}
-}
-
-func TestShouldAnnounce(t *testing.T) {
-	fakeSL := &fakeSpeakerList{
-		speakers: map[string]bool{
-			"iris1": true,
-			"iris2": true,
-		},
-	}
-	c1, err := newController(controllerConfig{
-		MyNode: "iris1",
-		Logger: log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
-		SList:  fakeSL,
-	})
-	if err != nil {
-		t.Fatalf("creating controller: %s", err)
-	}
-	c1.client = &testK8S{t: t}
-
-	c2, err := newController(controllerConfig{
-		MyNode: "iris2",
-		Logger: log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
-		SList:  fakeSL,
-	})
-	if err != nil {
-		t.Fatalf("creating controller: %s", err)
-	}
-	c2.client = &testK8S{t: t}
-
-	tests := []struct {
-		desc string
-
-		balancer string
-		config   *config.Config
-		svcs     []*v1.Service
-		eps      map[string]k8s.EpsOrSlices
-
-		c1ExpectedResult map[string]string
-		c2ExpectedResult map[string]string
-	}{
-		{
-			desc:     "One service, two endpoints, one host, controller 1 should announce",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris1"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-		},
-
-		{
-			desc:     "One service, two endpoints, one host, neither endpoint is ready, no controller should announce",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris1"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-		},
-		{
-			desc:     "One service, two endpoints across two hosts, controller2 should announce",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-		},
-
-		{
-			desc:     "One service, two endpoints across two hosts, neither endpoint is ready, no controllers should announce",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-		},
-
-		{
-			desc:     "One service, two endpoints across two hosts, controller 2 is not ready, controller 1 should announce",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-		},
-
-		{
-			desc:     "Two services each with two endpoints across across two hosts, controller 2 should announce for both services",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.2"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-				"10.20.30.2": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.35",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-				"10.20.30.2": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-				"10.20.30.2": "",
-			},
-		},
-
-		{
-			desc:     "Two services each with two endpoints across across two hosts, one service has an endpoint not ready on controller 2, controller 2 should not announce for the service with the not ready endpoint",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.2"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-				"10.20.30.2": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris1"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.35",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-				"10.20.30.2": "",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-				"10.20.30.2": "notOwner",
-			},
-		},
-
-		{
-			desc:     "Two services each with two endpoints across across two hosts, one service has an endpoint not ready on controller 1, the other service has an endpoint not ready on controller 2. Each controller should announce for the service with the ready endpoint on that controller",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.2"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris2"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris1"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-				"10.20.30.2": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris1"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.35",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-				"10.20.30.2": "",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-				"10.20.30.2": "notOwner",
-			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 2 hosts two endpoints controller 2 should announce for the service",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 1 hosts two endpoints controller 2 should announce for the service",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris1"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 2 hosts two endpoints, one of which is not ready, controller 2 should announce for the service",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 1 hosts two endpoints, one of which is not ready, controller 2 should announce for the service",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris1"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 2 hosts two endpoints, both of which are not ready, controller 1 should announce for the service",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					EpVal: &v1.Endpoints{
-						Subsets: []v1.EndpointSubset{
-							{
-								Addresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.5",
-										NodeName: strptr("iris1"),
-									},
-								},
-								NotReadyAddresses: []v1.EndpointAddress{
-									{
-										IP:       "2.3.4.15",
-										NodeName: strptr("iris2"),
-									},
-									{
-										IP:       "2.3.4.25",
-										NodeName: strptr("iris2"),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Eps,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-			},
-		},
-	}
-
-	l := log.NewNopLogger()
-	for _, test := range tests {
-		if test.config != nil {
-			if c1.SetConfig(l, test.config) == k8s.SyncStateError {
-				t.Errorf("%q: SetConfig failed", test.desc)
-			}
-			if c2.SetConfig(l, test.config) == k8s.SyncStateError {
-				t.Errorf("%q: SetConfig failed", test.desc)
-			}
-		}
-
-		for _, svc := range test.svcs {
-			lbIP := net.ParseIP(svc.Status.LoadBalancer.Ingress[0].IP)
-			lbIP_s := lbIP.String()
-			pool := c1.config.Pools[poolFor(c1.config.Pools, lbIP)]
-			response1 := c1.protocols[pool.Protocol].ShouldAnnounce(l, test.balancer, svc, test.eps[lbIP_s])
-			response2 := c2.protocols[pool.Protocol].ShouldAnnounce(l, test.balancer, svc, test.eps[lbIP_s])
-			if response1 != test.c1ExpectedResult[lbIP_s] {
-				t.Errorf("%q: shouldAnnounce for controller 1 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIP_s, test.c1ExpectedResult[lbIP_s], response1)
-			}
-			if response2 != test.c2ExpectedResult[lbIP_s] {
-				t.Errorf("%q: shouldAnnounce for controller 2 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIP_s, test.c2ExpectedResult[lbIP_s], response2)
-			}
 		}
 	}
 }
@@ -1170,6 +383,14 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 		t.Fatalf("creating controller: %s", err)
 	}
 	c2.client = &testK8S{t: t}
+	advertisementsForNode := []*config.L2Advertisement{
+		{
+			Nodes: map[string]bool{
+				"iris1": true,
+				"iris2": true,
+			},
+		},
+	}
 
 	tests := []struct {
 		desc string
@@ -1177,7 +398,7 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 		balancer string
 		config   *config.Config
 		svcs     []*v1.Service
-		eps      map[string]k8s.EpsOrSlices
+		eps      map[string][]discovery.EndpointSlice
 
 		c1ExpectedResult map[string]string
 		c2ExpectedResult map[string]string
@@ -1186,53 +407,46 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			desc:     "One service, two endpoints, one host, controller 1 should announce",
 			balancer: "test1",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1241,59 +455,49 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "notOwner",
 			},
-		},
-
-		{
-			desc:     "One service, two endpoints, one host, neither endpoint is ready, no controller should announce",
-			balancer: "test1",
+		}, {
+			desc: "One service, two endpoints, one host, neither endpoint is ready, no controller should announce",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1302,58 +506,50 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "notOwner",
 			},
-		},
-		{
-			desc:     "One service, two endpoints across two hosts, controller2 should announce",
-			balancer: "test1",
+		}, {
+			desc: "One service, two endpoints across two hosts, controller2 should announce",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready:   ptr.To(false),
+									Serving: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1362,59 +558,49 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "",
 			},
-		},
-
-		{
-			desc:     "One service, two endpoints across two hosts, neither endpoint is ready, no controllers should announce",
-			balancer: "test1",
+		}, {
+			desc: "One service, two endpoints across two hosts, neither endpoint is ready, no controllers should announce",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1423,59 +609,49 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "notOwner",
 			},
-		},
-
-		{
-			desc:     "One service, two endpoints across two hosts, controller 2 is not ready, controller 1 should announce",
-			balancer: "test1",
+		}, {
+			desc: "One service, two endpoints across two hosts, controller 2 is not ready, controller 1 should announce",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1484,198 +660,80 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "notOwner",
 			},
-		},
-
-		{
-			desc:     "Two services each with two endpoints across across two hosts, controller 2 should announce for both services",
-			balancer: "test1",
+		}, {
+			desc: "Two services each with two endpoints across across two hosts, each controller should announce one service",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.2"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 				"10.20.30.2": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.25",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.35",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.35",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
-				},
-			},
-			c1ExpectedResult: map[string]string{
-				"10.20.30.1": "notOwner",
-				"10.20.30.2": "notOwner",
-			},
-			c2ExpectedResult: map[string]string{
-				"10.20.30.1": "",
-				"10.20.30.2": "",
-			},
-		},
-
-		{
-			desc:     "Two services each with two endpoints across across two hosts, one service has an endpoint not ready on controller 2, controller 2 should not announce for the service with the not ready endpoint",
-			balancer: "test1",
-			config: &config.Config{
-				Pools: map[string]*config.Pool{
-					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
-					},
-				},
-			},
-			svcs: []*v1.Service{
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.1"),
-				},
-				{
-					Spec: v1.ServiceSpec{
-						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
-					},
-					Status: statusAssigned("10.20.30.2"),
-				},
-			},
-			eps: map[string]k8s.EpsOrSlices{
-				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
-								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Slices,
-				},
-				"10.20.30.2": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
-								},
-								{
-									Addresses: []string{
-										"2.3.4.35",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
-								},
-							},
-						},
-					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1686,97 +744,80 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 				"10.20.30.1": "",
 				"10.20.30.2": "notOwner",
 			},
-		},
-
-		{
-			desc:     "Two services each with two endpoints across across two hosts, one service has an endpoint not ready on controller 1, the other service has an endpoint not ready on controller 2. Each controller should announce for the service with the ready endpoint on that controller",
-			balancer: "test1",
+		}, {
+			desc: "Two services each with two endpoints across across two hosts, one service has an endpoint not ready on controller 2, each controller should announce one service",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.2"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 				"10.20.30.2": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.25",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.35",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.35",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1787,74 +828,146 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 				"10.20.30.1": "",
 				"10.20.30.2": "notOwner",
 			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 2 hosts two endpoints controller 2 should announce for the service",
-			balancer: "test1",
+		}, {
+			desc: "Two services each with two endpoints across across two hosts, one service has an endpoint not ready on controller 1, the other service has an endpoint not ready on controller 2. Each controller should announce for the service with the ready endpoint on that controller",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+					},
+					Status: statusAssigned("10.20.30.1"),
+				},
+				{
+					Spec: v1.ServiceSpec{
+						Type:                  "LoadBalancer",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+					},
+					Status: statusAssigned("10.20.30.2"),
+				},
+			},
+			eps: map[string][]discovery.EndpointSlice{
+				"10.20.30.1": {
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
+								},
+							},
+						},
+					},
+				},
+				"10.20.30.2": {
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.25",
+								},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.35",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
+								},
+							},
+						},
+					},
+				},
+			},
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+				"10.20.30.2": "",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+				"10.20.30.2": "notOwner",
+			},
+		}, {
+			desc: "One service with three endpoints across across two hosts, controller 2 hosts two endpoints controller 2 should announce for the service",
+			config: &config.Config{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
+					"default": {
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
+					},
+				}},
+			},
+			svcs: []*v1.Service{
+				{
+					Spec: v1.ServiceSpec{
+						Type:                  "LoadBalancer",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
-						},
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.25",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+						},
+					},
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1863,70 +976,58 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "",
 			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 1 hosts two endpoints controller 2 should announce for the service",
-			balancer: "test1",
+		}, {
+			desc: "One service with three endpoints across across two hosts, controller 1 hosts two endpoints controller 2 should announce for the service",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.25",
+								},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -1935,70 +1036,58 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "",
 			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 2 hosts two endpoints, one of which is not ready, controller 2 should announce for the service",
-			balancer: "test1",
+		}, {
+			desc: "One service with three endpoints across across two hosts, controller 2 hosts two endpoints, one of which is not ready, controller 2 should announce for the service",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.25",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -2007,70 +1096,58 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "",
 			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 1 hosts two endpoints, one of which is not ready, controller 2 should announce for the service",
-			balancer: "test1",
+		}, {
+			desc: "One service with three endpoints across across two hosts, controller 1 hosts two endpoints, one of which is not ready, controller 1 should announce for the service",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.25",
+								},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -2079,70 +1156,58 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 			c2ExpectedResult: map[string]string{
 				"10.20.30.1": "",
 			},
-		},
-
-		{
-			desc:     "One service with three endpoints across across two hosts, controller 2 hosts two endpoints, both of which are not ready, controller 1 should announce for the service",
-			balancer: "test1",
+		}, {
+			desc: "One service with three endpoints across across two hosts, controller 2 hosts two endpoints, both of which are not ready, controller 1 should announce for the service",
 			config: &config.Config{
-				Pools: map[string]*config.Pool{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
 					"default": {
-						Protocol: config.Layer2,
-						CIDR:     []*net.IPNet{ipnet("10.20.30.0/24")},
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: advertisementsForNode,
 					},
-				},
+				}},
 			},
 			svcs: []*v1.Service{
 				{
 					Spec: v1.ServiceSpec{
 						Type:                  "LoadBalancer",
-						ExternalTrafficPolicy: "Cluster",
+						ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
 					},
 					Status: statusAssigned("10.20.30.1"),
 				},
 			},
-			eps: map[string]k8s.EpsOrSlices{
+			eps: map[string][]discovery.EndpointSlice{
 				"10.20.30.1": {
-					SlicesVal: []*discovery.EndpointSlice{
-						{
-							Endpoints: []discovery.Endpoint{
-								{
-									Addresses: []string{
-										"2.3.4.5",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris1",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(true),
-									},
+					{
+						Endpoints: []discovery.Endpoint{
+							{
+								Addresses: []string{
+									"2.3.4.5",
 								},
-								{
-									Addresses: []string{
-										"2.3.4.15",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+								NodeName: ptr.To("iris1"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(true),
 								},
-								{
-									Addresses: []string{
-										"2.3.4.25",
-									},
-									Topology: map[string]string{
-										"kubernetes.io/hostname": "iris2",
-									},
-									Conditions: discovery.EndpointConditions{
-										Ready: boolPtr(false),
-									},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.15",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
+								},
+							},
+							{
+								Addresses: []string{
+									"2.3.4.25",
+								},
+								NodeName: ptr.To("iris2"),
+								Conditions: discovery.EndpointConditions{
+									Ready: ptr.To(false),
 								},
 							},
 						},
 					},
-					Type: k8s.Slices,
 				},
 			},
 			c1ExpectedResult: map[string]string{
@@ -2157,30 +1222,1707 @@ func TestShouldAnnounceEPSlices(t *testing.T) {
 	l := log.NewNopLogger()
 	for _, test := range tests {
 		if test.config != nil {
-			if c1.SetConfig(l, test.config) == k8s.SyncStateError {
+			if c1.SetConfig(l, test.config) == controllers.SyncStateError {
 				t.Errorf("%q: SetConfig failed", test.desc)
 			}
-			if c2.SetConfig(l, test.config) == k8s.SyncStateError {
+			if c2.SetConfig(l, test.config) == controllers.SyncStateError {
 				t.Errorf("%q: SetConfig failed", test.desc)
 			}
 		}
 
 		for _, svc := range test.svcs {
 			lbIP := net.ParseIP(svc.Status.LoadBalancer.Ingress[0].IP)
-			lbIP_s := lbIP.String()
-			pool := c1.config.Pools[poolFor(c1.config.Pools, lbIP)]
-			response1 := c1.protocols[pool.Protocol].ShouldAnnounce(l, test.balancer, svc, test.eps[lbIP_s])
-			response2 := c2.protocols[pool.Protocol].ShouldAnnounce(l, test.balancer, svc, test.eps[lbIP_s])
-			if response1 != test.c1ExpectedResult[lbIP_s] {
-				t.Errorf("%q: shouldAnnounce for controller 1 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIP_s, test.c1ExpectedResult[lbIP_s], response1)
+			lbIPStr := lbIP.String()
+			response1 := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, test.config.Pools.ByName["default"], svc, test.eps[lbIPStr], nil)
+			response2 := c2.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, test.config.Pools.ByName["default"], svc, test.eps[lbIPStr], nil)
+			if response1 != test.c1ExpectedResult[lbIPStr] {
+				t.Errorf("%q: shouldAnnounce for controller 1 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIPStr, test.c1ExpectedResult[lbIPStr], response1)
 			}
-			if response2 != test.c2ExpectedResult[lbIP_s] {
-				t.Errorf("%q: shouldAnnounce for controller 2 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIP_s, test.c2ExpectedResult[lbIP_s], response2)
+			if response2 != test.c2ExpectedResult[lbIPStr] {
+				t.Errorf("%q: shouldAnnounce for controller 2 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIPStr, test.c2ExpectedResult[lbIPStr], response2)
 			}
 		}
 	}
 }
 
-func boolPtr(b bool) *bool {
-	return &b
+func TestShouldAnnounceFromNodes(t *testing.T) {
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+			"iris2": true,
+		},
+	}
+	advertisementsForBoth := []*config.L2Advertisement{
+		{
+			Nodes: map[string]bool{
+				"iris1": true,
+				"iris2": true,
+			},
+		},
+	}
+
+	advertisementOnIris1 := []*config.L2Advertisement{
+		{
+			Nodes: map[string]bool{
+				"iris1": true,
+			},
+		},
+	}
+
+	advertisementSplit := []*config.L2Advertisement{
+		{
+			Nodes: map[string]bool{
+				"iris1": true,
+			},
+		},
+		{
+			Nodes: map[string]bool{
+				"iris2": true,
+			},
+		},
+	}
+
+	advertisementOnIris2 := []*config.L2Advertisement{
+		{
+			Nodes: map[string]bool{
+				"iris2": true,
+			},
+		},
+	}
+
+	epsOnBothNodes := map[string][]discovery.EndpointSlice{
+		"10.20.30.1": {
+			{
+				Endpoints: []discovery.Endpoint{
+					{
+						Addresses: []string{
+							"2.3.4.5",
+						},
+						NodeName: ptr.To("iris1"),
+						Conditions: discovery.EndpointConditions{
+							Ready: ptr.To(true),
+						},
+					},
+					{
+						Addresses: []string{
+							"2.3.4.15",
+						},
+						NodeName: ptr.To("iris2"),
+						Conditions: discovery.EndpointConditions{
+							Ready: ptr.To(true),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	epsOn := func(node string) map[string][]discovery.EndpointSlice {
+		return map[string][]discovery.EndpointSlice{
+			"10.20.30.1": {
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses: []string{
+								"2.3.4.5",
+							},
+							NodeName: ptr.To(node),
+							Conditions: discovery.EndpointConditions{
+								Ready: ptr.To(true),
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		desc string
+
+		balancer            string
+		L2Advertisements    []*config.L2Advertisement
+		eps                 map[string][]discovery.EndpointSlice
+		trafficPolicy       v1.ServiceExternalTrafficPolicy
+		excludeFromLB       []string
+		ignoreExcludeFromLB bool
+		c1ExpectedResult    map[string]string
+		c2ExpectedResult    map[string]string
+	}{
+		{
+			desc:             "One service, endpoint on iris1, selector on iris1, c1 should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementOnIris1,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeCluster,
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "noMatchingAdvertisement",
+			},
+		},
+		{
+			desc:             "One service, etp local, endpoint on iris1, selector on both(split), c2 should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementSplit,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeLocal,
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+		},
+		{
+			desc:             "One service, endpoint on iris1, selector on both, c2 should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementsForBoth,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeCluster,
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+		},
+		{
+			desc:             "One service, endpoint on both nodes, advertisement on iris1, c1 should announce",
+			balancer:         "test1",
+			eps:              epsOnBothNodes,
+			L2Advertisements: advertisementOnIris1,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeCluster,
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "noMatchingAdvertisement",
+			},
+		},
+		{
+			desc:             "One service, ltp endpoint on iris1, advertisement on iris2, no one should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementOnIris2,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeLocal,
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "noMatchingAdvertisement",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+		},
+		{
+			desc:             "One service, endpoint on iris1, no selector, iris2 excluded, c1 should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementsForBoth,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeCluster,
+			excludeFromLB:    []string{"iris2"},
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+		},
+		{
+			desc:             "One service, endpoint on iris1, no selector, iris1 excluded, c2 should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementsForBoth,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeCluster,
+			excludeFromLB:    []string{"iris1"},
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+		},
+		{
+			desc:             "One service, endpoint on iris1, no selector, both excluded, both should not announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementsForBoth,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeCluster,
+			excludeFromLB:    []string{"iris1", "iris2"},
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+		},
+		{
+			desc:             "One service, endpoint on iris1, no selector, etplocal, both excluded, ignore excludelb, c1 should announce",
+			balancer:         "test1",
+			eps:              epsOn("iris1"),
+			L2Advertisements: advertisementsForBoth,
+			trafficPolicy:    v1.ServiceExternalTrafficPolicyTypeLocal,
+			excludeFromLB:    []string{"iris1", "iris2"},
+			c1ExpectedResult: map[string]string{
+				"10.20.30.1": "",
+			},
+			c2ExpectedResult: map[string]string{
+				"10.20.30.1": "notOwner",
+			},
+			ignoreExcludeFromLB: true,
+		},
+	}
+	l := log.NewNopLogger()
+	for _, test := range tests {
+		cfg := config.Config{
+			Pools: &config.Pools{ByName: map[string]*config.Pool{
+				"default": {
+					CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+					L2Advertisements: test.L2Advertisements,
+				},
+			}},
+		}
+		c1, err := newController(controllerConfig{
+			MyNode:          "iris1",
+			Logger:          log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+			SList:           fakeSL,
+			bgpType:         bgpNative,
+			IgnoreExcludeLB: test.ignoreExcludeFromLB,
+		})
+		if err != nil {
+			t.Fatalf("creating controller: %s", err)
+		}
+		c1.client = &testK8S{t: t}
+
+		c2, err := newController(controllerConfig{
+			MyNode:          "iris2",
+			Logger:          log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+			SList:           fakeSL,
+			bgpType:         bgpNative,
+			IgnoreExcludeLB: test.ignoreExcludeFromLB,
+		})
+		if err != nil {
+			t.Fatalf("creating controller: %s", err)
+		}
+		c2.client = &testK8S{t: t}
+
+		if c1.SetConfig(l, &cfg) == controllers.SyncStateError {
+			t.Errorf("%q: SetConfig failed", test.desc)
+		}
+		if c2.SetConfig(l, &cfg) == controllers.SyncStateError {
+			t.Errorf("%q: SetConfig failed", test.desc)
+		}
+		svc := v1.Service{
+			Spec: v1.ServiceSpec{
+				Type:                  "LoadBalancer",
+				ExternalTrafficPolicy: test.trafficPolicy,
+			},
+			Status: statusAssigned("10.20.30.1"),
+		}
+
+		lbIP := net.ParseIP(svc.Status.LoadBalancer.Ingress[0].IP)
+		lbIPStr := lbIP.String()
+
+		nodes := map[string]*v1.Node{
+			"iris1": {
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "iris1",
+				},
+			},
+			"iris2": {
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "iris2",
+				},
+			},
+		}
+		for _, n := range test.excludeFromLB {
+			nodes[n].Labels = map[string]string{
+				v1.LabelNodeExcludeBalancers: "",
+			}
+		}
+
+		response1 := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], &svc, test.eps[lbIPStr], nodes)
+		response2 := c2.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], &svc, test.eps[lbIPStr], nodes)
+		if response1 != test.c1ExpectedResult[lbIPStr] {
+			t.Errorf("%q: shouldAnnounce for controller 1 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIPStr, test.c1ExpectedResult[lbIPStr], response1)
+		}
+		if response2 != test.c2ExpectedResult[lbIPStr] {
+			t.Errorf("%q: shouldAnnounce for controller 2 for service %s returned incorrect result, expected '%s', but received '%s'", test.desc, lbIPStr, test.c2ExpectedResult[lbIPStr], response2)
+		}
+	}
+}
+
+func TestClusterPolicy(t *testing.T) {
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+			"iris2": true,
+		},
+	}
+	c1, err := newController(controllerConfig{
+		MyNode: "iris1",
+		Logger: log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:  fakeSL,
+	})
+	if err != nil {
+		t.Fatalf("creating controller: %s", err)
+	}
+	c1.client = &testK8S{t: t}
+
+	c2, err := newController(controllerConfig{
+		MyNode: "iris2",
+		Logger: log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:  fakeSL,
+	})
+	if err != nil {
+		t.Fatalf("creating controller: %s", err)
+	}
+	c2.client = &testK8S{t: t}
+
+	l := log.NewNopLogger()
+
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR: []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: []*config.L2Advertisement{
+					{
+						Nodes: map[string]bool{
+							"iris1": true,
+							"iris2": true,
+						},
+					},
+				},
+			},
+		}},
+	}
+
+	if c1.SetConfig(l, cfg) == controllers.SyncStateError {
+		t.Errorf("SetConfig failed")
+	}
+	if c2.SetConfig(l, cfg) == controllers.SyncStateError {
+		t.Errorf("SetConfig failed")
+	}
+
+	eps1 := []discovery.EndpointSlice{
+		{
+			Endpoints: []discovery.Endpoint{
+				{
+					Addresses: []string{
+						"2.3.4.5",
+					},
+					NodeName: ptr.To("iris1"),
+					Conditions: discovery.EndpointConditions{
+						Ready: ptr.To(true),
+					},
+				},
+			},
+		},
+	}
+
+	eps2 := []discovery.EndpointSlice{
+		{
+			Endpoints: []discovery.Endpoint{
+				{
+					Addresses: []string{
+						"2.3.4.5",
+					},
+					NodeName: ptr.To("iris2"),
+					Conditions: discovery.EndpointConditions{
+						Ready: ptr.To(true),
+					},
+				},
+			},
+		},
+	}
+	c1Found := false
+	c2Found := false
+
+	// Cluster policy doesn't care about the locality of the endpoint, as long as there is
+	// at least one endpoint active. Here we check that the distribution of the service happens
+	// in a way that only a speaker notifies it, and that the assignement is consistent with the
+	// service ip.
+	for i := 1; i < 256; i++ {
+		ip := fmt.Sprintf("10.20.30.%d", i)
+		svc1 := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "svc1",
+			},
+			Spec: v1.ServiceSpec{
+				Type:                  "LoadBalancer",
+				ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+			},
+			Status: statusAssigned(ip),
+		}
+		svc2 := &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "svc2",
+			},
+			Spec: v1.ServiceSpec{
+				Type:                  "LoadBalancer",
+				ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+			},
+			Status: statusAssigned(ip),
+		}
+
+		lbIP := net.ParseIP(ip)
+		response1svc1 := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc1, eps1, nil)
+		response2svc1 := c2.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc1, eps1, nil)
+
+		response1svc2 := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc2, eps2, nil)
+		response2svc2 := c2.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc2, eps2, nil)
+
+		// We check that only one speaker announces the service, so their response must be different
+		if response1svc1 == response2svc1 {
+			t.Fatalf("Expected only one speaker to announce ip %s , got %s from speaker1, %s from speaker2", ip, response1svc1, response2svc1)
+		}
+		// Speakers must announce different services with the same ip as the same way
+		if response1svc1 != response1svc2 {
+			t.Fatalf("Expected both speakers announce svc1 and svc2 with ip %s consistently, got %s from speaker1 for svc1, %s from speaker1 for svc2", ip, response1svc1, response1svc2)
+		}
+		if response2svc1 != response2svc2 {
+			t.Fatalf("Expected both speakers announce svc1 and svc2 with ip %s consistently, got %s from speaker2 for svc1, %s from speaker2 for svc2", ip, response1svc1, response1svc2)
+		}
+
+		// we check that both speaker announce at least one service
+		if response1svc1 == "" {
+			c1Found = true
+		}
+		if response2svc1 == "" {
+			c2Found = true
+		}
+	}
+	if !c1Found {
+		t.Fatalf("All services assigned to speaker2")
+	}
+	if !c2Found {
+		t.Fatalf("All services assigned to speaker1")
+	}
+}
+
+func TestL2ServiceSelectors(t *testing.T) {
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+		},
+	}
+	c1, err := newController(controllerConfig{
+		MyNode:  "iris1",
+		Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:   fakeSL,
+		bgpType: bgpNative,
+	})
+	if err != nil {
+		t.Fatalf("creating controller: %s", err)
+	}
+	c1.client = &testK8S{t: t}
+
+	tests := []struct {
+		desc             string
+		L2Advertisements []*config.L2Advertisement
+		svc              *v1.Service
+		expected         string
+	}{
+		{
+			desc: "Empty selector matches all services",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: nil,
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "test-svc",
+					Labels: map[string]string{"app": "nginx"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "",
+		},
+		{
+			desc: "Matching selector allows announcement",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: []labels.Selector{selector("app=nginx")},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "test-svc",
+					Labels: map[string]string{"app": "nginx"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "",
+		},
+		{
+			desc: "Non-matching selector prevents announcement",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: []labels.Selector{selector("app=apache")},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "test-svc",
+					Labels: map[string]string{"app": "nginx"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "noMatchingAdvertisement",
+		},
+		{
+			desc: "Multiple selectors - OR logic - one matches",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:         map[string]bool{"iris1": true},
+					AllInterfaces: true,
+					ServiceSelectors: []labels.Selector{
+						selector("app=apache"),
+						selector("app=nginx"),
+					},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "test-svc",
+					Labels: map[string]string{"app": "nginx"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "",
+		},
+	}
+
+	l := log.NewNopLogger()
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			cfg := &config.Config{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
+					"default": {
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: test.L2Advertisements,
+					},
+				}},
+			}
+			if c1.SetConfig(l, cfg) == controllers.SyncStateError {
+				t.Errorf("SetConfig failed")
+			}
+
+			lbIP := net.ParseIP(test.svc.Status.LoadBalancer.Ingress[0].IP)
+			eps := []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses:  []string{"2.3.4.5"},
+							NodeName:   ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+						},
+					},
+				},
+			}
+
+			response := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], test.svc, eps, nil)
+			if response != test.expected {
+				t.Errorf("expected %q, got %q", test.expected, response)
+			}
+		})
+	}
+}
+
+func TestL2SharedIPWithServiceSelectors(t *testing.T) {
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+		},
+	}
+	c1, err := newController(controllerConfig{
+		MyNode:  "iris1",
+		Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:   fakeSL,
+		bgpType: bgpNative,
+	})
+	if err != nil {
+		t.Fatalf("creating controller: %s", err)
+	}
+	c1.client = &testK8S{t: t}
+
+	tests := []struct {
+		desc             string
+		L2Advertisements []*config.L2Advertisement
+		svc              *v1.Service
+		expected         string
+	}{
+		{
+			desc: "allow-shared-ip with serviceSelectors is denied",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: []labels.Selector{selector("app=nginx")},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-svc",
+					Labels:      map[string]string{"app": "nginx"},
+					Annotations: map[string]string{"metallb.io/allow-shared-ip": "shared"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "sharedIPWithServiceSelector",
+		},
+		{
+			desc: "allow-shared-ip without serviceSelectors is allowed",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:         map[string]bool{"iris1": true},
+					AllInterfaces: true,
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-svc",
+					Labels:      map[string]string{"app": "nginx"},
+					Annotations: map[string]string{"metallb.io/allow-shared-ip": "shared"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "",
+		},
+		{
+			desc: "no allow-shared-ip with serviceSelectors is allowed",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: []labels.Selector{selector("app=nginx")},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "test-svc",
+					Labels: map[string]string{"app": "nginx"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "",
+		},
+		{
+			desc: "deprecated allow-shared-ip with serviceSelectors is denied",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: []labels.Selector{selector("app=nginx")},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-svc",
+					Labels:      map[string]string{"app": "nginx"},
+					Annotations: map[string]string{"metallb.universe.tf/allow-shared-ip": "shared"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "sharedIPWithServiceSelector",
+		},
+		{
+			desc: "allow-shared-ip with mixed ads (one with selectors) is denied",
+			L2Advertisements: []*config.L2Advertisement{
+				{
+					Nodes:         map[string]bool{"iris1": true},
+					AllInterfaces: true,
+				},
+				{
+					Nodes:            map[string]bool{"iris1": true},
+					AllInterfaces:    true,
+					ServiceSelectors: []labels.Selector{selector("app=nginx")},
+				},
+			},
+			svc: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-svc",
+					Labels:      map[string]string{"app": "nginx"},
+					Annotations: map[string]string{"metallb.io/allow-shared-ip": "shared"},
+				},
+				Spec: v1.ServiceSpec{
+					Type:                  v1.ServiceTypeLoadBalancer,
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			expected: "sharedIPWithServiceSelector",
+		},
+	}
+
+	l := log.NewNopLogger()
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			cfg := &config.Config{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
+					"default": {
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: test.L2Advertisements,
+					},
+				}},
+			}
+			if c1.SetConfig(l, cfg) == controllers.SyncStateError {
+				t.Errorf("SetConfig failed")
+			}
+
+			lbIP := net.ParseIP(test.svc.Status.LoadBalancer.Ingress[0].IP)
+			eps := []discovery.EndpointSlice{
+				{
+					Endpoints: []discovery.Endpoint{
+						{
+							Addresses:  []string{"2.3.4.5"},
+							NodeName:   ptr.To("iris1"),
+							Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+						},
+					},
+				},
+			}
+
+			response := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], test.svc, eps, nil)
+			if response != test.expected {
+				t.Errorf("expected %q, got %q", test.expected, response)
+			}
+		})
+	}
+}
+
+func TestL2AdsForService(t *testing.T) {
+	ad1 := &config.L2Advertisement{Nodes: map[string]bool{"nodeA": true}, AllInterfaces: true}
+	ad2 := &config.L2Advertisement{Nodes: map[string]bool{"nodeA": true}, AllInterfaces: true, ServiceSelectors: []labels.Selector{selector("app=nginx")}}
+	ad3 := &config.L2Advertisement{Nodes: map[string]bool{"nodeA": true}, AllInterfaces: true, ServiceSelectors: []labels.Selector{selector("app=apache")}}
+	ad4 := &config.L2Advertisement{Nodes: map[string]bool{"nodeB": true}, AllInterfaces: true}
+
+	tests := []struct {
+		desc     string
+		ads      []*config.L2Advertisement
+		svc      *v1.Service
+		expected []*config.L2Advertisement
+	}{
+		{
+			desc:     "Empty selectors match all",
+			ads:      []*config.L2Advertisement{ad1},
+			svc:      &v1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx"}}},
+			expected: []*config.L2Advertisement{ad1},
+		},
+		{
+			desc:     "Matching selector",
+			ads:      []*config.L2Advertisement{ad2},
+			svc:      &v1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx"}}},
+			expected: []*config.L2Advertisement{ad2},
+		},
+		{
+			desc:     "Non-matching selector",
+			ads:      []*config.L2Advertisement{ad3},
+			svc:      &v1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx"}}},
+			expected: []*config.L2Advertisement{},
+		},
+		{
+			desc:     "Ad with no matching selector is still returned (node filtering is separate)",
+			ads:      []*config.L2Advertisement{ad4},
+			svc:      &v1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx"}}},
+			expected: []*config.L2Advertisement{ad4},
+		},
+		{
+			desc:     "Multiple ads - some match by service selector",
+			ads:      []*config.L2Advertisement{ad3, ad2, ad1}, // apache selector, nginx selector, empty (matches all)
+			svc:      &v1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "nginx"}}},
+			expected: []*config.L2Advertisement{ad2, ad1}, // nginx match + empty match
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			result := l2AdsForService(test.ads, test.svc)
+			if len(result) != len(test.expected) {
+				t.Errorf("expected %d ads, got %d", len(test.expected), len(result))
+				return
+			}
+			expectedAds := sets.New(test.expected...)
+			gotAds := sets.New(result...)
+			if !gotAds.Equal(expectedAds) {
+				t.Errorf("returned ads do not match expected")
+			}
+		})
+	}
+}
+
+func selector(s string) labels.Selector {
+	ret, err := labels.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return ret
+}
+
+func TestL2ElectionConsistentButAdsPerNode(t *testing.T) {
+	// Two ads target the same service but different nodes with different
+	// interfaces. The election must be identical on both nodes (same candidate
+	// set), but each node must announce using only its own interface.
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+			"iris2": true,
+		},
+	}
+
+	l2Advertisements := []*config.L2Advertisement{
+		{
+			Nodes:            map[string]bool{"iris1": true},
+			Interfaces:       []string{"eth0"},
+			ServiceSelectors: []labels.Selector{selector("app=web")},
+		},
+		{
+			Nodes:            map[string]bool{"iris2": true},
+			Interfaces:       []string{"eth1"},
+			ServiceSelectors: []labels.Selector{selector("app=web")},
+		},
+	}
+
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: l2Advertisements,
+			},
+		}},
+	}
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "svc-web",
+			Labels: map[string]string{"app": "web"},
+		},
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+		Status: statusAssigned("10.20.30.1"),
+	}
+
+	eps := []discovery.EndpointSlice{
+		{
+			Endpoints: []discovery.Endpoint{
+				{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("iris1"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				},
+				{
+					Addresses:  []string{"2.3.4.15"},
+					NodeName:   ptr.To("iris2"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				},
+			},
+		},
+	}
+
+	l := log.NewNopLogger()
+	lbIP := net.ParseIP("10.20.30.1")
+	pool := cfg.Pools.ByName["default"]
+
+	c1, err := newController(controllerConfig{
+		MyNode:  "iris1",
+		Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:   fakeSL,
+		bgpType: bgpNative,
+	})
+	if err != nil {
+		t.Fatalf("creating controller: %s", err)
+	}
+	c1.client = &testK8S{t: t}
+
+	c2, err := newController(controllerConfig{
+		MyNode:  "iris2",
+		Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+		SList:   fakeSL,
+		bgpType: bgpNative,
+	})
+	if err != nil {
+		t.Fatalf("creating controller: %s", err)
+	}
+	c2.client = &testK8S{t: t}
+
+	if c1.SetConfig(l, cfg) == controllers.SyncStateError {
+		t.Fatal("c1 SetConfig failed")
+	}
+	if c2.SetConfig(l, cfg) == controllers.SyncStateError {
+		t.Fatal("c2 SetConfig failed")
+	}
+
+	// Exactly one node must win the election.
+	r1 := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, pool, svc, eps, nil)
+	r2 := c2.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, pool, svc, eps, nil)
+
+	if (r1 == "") == (r2 == "") {
+		t.Fatalf("expected exactly one winner, got c1=%q c2=%q", r1, r2)
+	}
+
+	// Each node's IPAdvertisement must use only its own interface.
+	adsForSvc := l2AdsForService(pool.L2Advertisements, svc)
+	ipAdv1 := ipAdvertisementFor(lbIP, l2AdsForNode(adsForSvc, "iris1"))
+	ipAdv2 := ipAdvertisementFor(lbIP, l2AdsForNode(adsForSvc, "iris2"))
+
+	expected1 := layer2.NewIPAdvertisement(lbIP, false, sets.New("eth0"))
+	expected2 := layer2.NewIPAdvertisement(lbIP, false, sets.New("eth1"))
+
+	if !ipAdv1.Equal(&expected1) {
+		t.Errorf("iris1 should use eth0, got %v", ipAdv1)
+	}
+	if !ipAdv2.Equal(&expected2) {
+		t.Errorf("iris2 should use eth1, got %v", ipAdv2)
+	}
+}
+
+func TestL2NoMatchingAdForServiceAndNode(t *testing.T) {
+	// One ad matches all nodes but targets a different service.
+	// Another ad matches our service but targets a non-existing node.
+	// No node should announce.
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+			"iris2": true,
+		},
+	}
+
+	l2Advertisements := []*config.L2Advertisement{
+		{
+			Nodes:            map[string]bool{"iris1": true, "iris2": true},
+			AllInterfaces:    true,
+			ServiceSelectors: []labels.Selector{selector("app=other")},
+		},
+		{
+			Nodes:            map[string]bool{"ghost": true},
+			AllInterfaces:    true,
+			ServiceSelectors: []labels.Selector{selector("app=web")},
+		},
+	}
+
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: l2Advertisements,
+			},
+		}},
+	}
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "svc-web",
+			Labels: map[string]string{"app": "web"},
+		},
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+		Status: statusAssigned("10.20.30.1"),
+	}
+
+	eps := []discovery.EndpointSlice{
+		{
+			Endpoints: []discovery.Endpoint{
+				{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("iris1"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				},
+				{
+					Addresses:  []string{"2.3.4.15"},
+					NodeName:   ptr.To("iris2"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				},
+			},
+		},
+	}
+
+	l := log.NewNopLogger()
+	lbIP := net.ParseIP("10.20.30.1")
+	pool := cfg.Pools.ByName["default"]
+
+	for _, node := range []string{"iris1", "iris2"} {
+		c, err := newController(controllerConfig{
+			MyNode:  node,
+			Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+			SList:   fakeSL,
+			bgpType: bgpNative,
+		})
+		if err != nil {
+			t.Fatalf("creating controller for %s: %s", node, err)
+		}
+		c.client = &testK8S{t: t}
+
+		if c.SetConfig(l, cfg) == controllers.SyncStateError {
+			t.Fatalf("%s SetConfig failed", node)
+		}
+
+		r := c.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, pool, svc, eps, nil)
+		if r != "noMatchingAdvertisement" {
+			t.Errorf("%s: expected %q, got %q", node, "noMatchingAdvertisement", r)
+		}
+	}
+}
+
+func TestL2ServiceSelectorFiltersCandidateNodes(t *testing.T) {
+	// when two L2 advertisements target different nodes with
+	// different service selectors, the election set must only include nodes whose
+	// advertisement actually matches the service. Otherwise a node that wins the
+	// election but has no matching advertisement causes the service to go unannounced.
+	fakeSL := &fakeSpeakerList{
+		speakers: map[string]bool{
+			"iris1": true,
+			"iris2": true,
+		},
+	}
+
+	l2Advertisements := []*config.L2Advertisement{
+		{
+			Nodes:            map[string]bool{"iris1": true},
+			AllInterfaces:    true,
+			ServiceSelectors: []labels.Selector{selector("app=foo")},
+		},
+		{
+			Nodes:            map[string]bool{"iris2": true},
+			AllInterfaces:    true,
+			ServiceSelectors: []labels.Selector{selector("app=bar")},
+		},
+	}
+
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: l2Advertisements,
+			},
+		}},
+	}
+
+	l := log.NewNopLogger()
+
+	svcFoo := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "svc-foo",
+			Labels: map[string]string{"app": "foo"},
+		},
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+		Status: statusAssigned("10.20.30.1"),
+	}
+
+	svcBar := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "svc-bar",
+			Labels: map[string]string{"app": "bar"},
+		},
+		Spec: v1.ServiceSpec{
+			Type:                  v1.ServiceTypeLoadBalancer,
+			ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeCluster,
+		},
+		Status: statusAssigned("10.20.30.1"),
+	}
+
+	eps := []discovery.EndpointSlice{
+		{
+			Endpoints: []discovery.Endpoint{
+				{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("iris1"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				},
+				{
+					Addresses:  []string{"2.3.4.15"},
+					NodeName:   ptr.To("iris2"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				},
+			},
+		},
+	}
+
+	lbIP := net.ParseIP("10.20.30.1")
+
+	tests := []struct {
+		desc             string
+		svc              *v1.Service
+		c1ExpectedResult string
+		c2ExpectedResult string
+	}{
+		{
+			desc:             "svc-foo matches only iris1's adv, iris1 must announce",
+			svc:              svcFoo,
+			c1ExpectedResult: "",
+			c2ExpectedResult: "noMatchingAdvertisement",
+		},
+		{
+			desc:             "svc-bar matches only iris2's adv, iris2 must announce",
+			svc:              svcBar,
+			c1ExpectedResult: "noMatchingAdvertisement",
+			c2ExpectedResult: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			c1, err := newController(controllerConfig{
+				MyNode:  "iris1",
+				Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+				SList:   fakeSL,
+				bgpType: bgpNative,
+			})
+			if err != nil {
+				t.Fatalf("creating controller: %s", err)
+			}
+			c1.client = &testK8S{t: t}
+
+			c2, err := newController(controllerConfig{
+				MyNode:  "iris2",
+				Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+				SList:   fakeSL,
+				bgpType: bgpNative,
+			})
+			if err != nil {
+				t.Fatalf("creating controller: %s", err)
+			}
+			c2.client = &testK8S{t: t}
+
+			if c1.SetConfig(l, cfg) == controllers.SyncStateError {
+				t.Fatal("c1 SetConfig failed")
+			}
+			if c2.SetConfig(l, cfg) == controllers.SyncStateError {
+				t.Fatal("c2 SetConfig failed")
+			}
+
+			r1 := c1.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], test.svc, eps, nil)
+			r2 := c2.protocolHandlers[config.Layer2].ShouldAnnounce(l, "test1", []net.IP{lbIP}, cfg.Pools.ByName["default"], test.svc, eps, nil)
+
+			if r1 != test.c1ExpectedResult {
+				t.Errorf("c1 (iris1): expected %q, got %q", test.c1ExpectedResult, r1)
+			}
+			if r2 != test.c2ExpectedResult {
+				t.Errorf("c2 (iris2): expected %q, got %q", test.c2ExpectedResult, r2)
+			}
+		})
+	}
+}
+
+func TestIPAdvertisementFor(t *testing.T) {
+	tests := []struct {
+		desc             string
+		ip               net.IP
+		l2Advertisements []*config.L2Advertisement
+		expect           layer2.IPAdvertisement
+	}{
+		{
+			desc: "AllInterfaces set",
+			ip:   net.IP{192, 168, 10, 3},
+			l2Advertisements: []*config.L2Advertisement{
+				{
+					Interfaces:    []string{},
+					AllInterfaces: true,
+				},
+			},
+			expect: layer2.NewIPAdvertisement(net.IP{192, 168, 10, 3}, true, sets.Set[string]{}),
+		},
+		{
+			desc: "Single L2Advertisement with interfaces",
+			ip:   net.ParseIP("2000:12"),
+			l2Advertisements: []*config.L2Advertisement{
+				{
+					Interfaces: []string{"eth1", "eth2"},
+				},
+			},
+			expect: layer2.NewIPAdvertisement(net.ParseIP("2000:12"), false, sets.New("eth1", "eth2")),
+		},
+		{
+			desc: "Multiple L2Advertisements - interfaces merged",
+			ip:   net.IP{192, 168, 10, 3},
+			l2Advertisements: []*config.L2Advertisement{
+				{
+					Interfaces: []string{"eth0", "eth1"},
+				}, {
+					Interfaces: []string{"eth0", "eth2"},
+				},
+			},
+			expect: layer2.NewIPAdvertisement(net.IP{192, 168, 10, 3}, false, sets.New("eth0", "eth1", "eth2")),
+		},
+		{
+			desc: "Multiple L2Advertisements - one has AllInterfaces",
+			ip:   net.IP{192, 168, 10, 3},
+			l2Advertisements: []*config.L2Advertisement{
+				{
+					Interfaces: []string{"eth0", "eth1"},
+				}, {
+					AllInterfaces: true,
+				},
+			},
+			expect: layer2.NewIPAdvertisement(net.IP{192, 168, 10, 3}, true, sets.Set[string]{}),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			r := ipAdvertisementFor(test.ip, test.l2Advertisements)
+			if !r.Equal(&test.expect) {
+				t.Errorf("expect %+v, but got %+v", test.expect, r)
+			}
+		})
+	}
+}
+
+func TestSortL2Candidates(t *testing.T) {
+	tests := []struct {
+		desc       string
+		candidates []string
+		ip         string
+		scores     map[string]int64
+		want       []string
+	}{
+		{
+			desc: "empty input",
+			ip:   "10.0.0.1",
+		},
+		{
+			desc:       "single candidate",
+			candidates: []string{"node-a"},
+			ip:         "10.0.0.1",
+			want:       []string{"node-a"},
+		},
+		{
+			desc:       "no scores: stable hash order independent of input order",
+			candidates: []string{"node-a", "node-b", "node-c"},
+			ip:         "10.0.0.1",
+			want:       []string{"node-b", "node-a", "node-c"},
+		},
+		{
+			desc:       "no scores: hash order depends on the IP",
+			candidates: []string{"node-a", "node-b", "node-c"},
+			ip:         "10.0.0.2",
+			want:       []string{"node-b", "node-c", "node-a"},
+		},
+		{
+			desc:       "highest score wins regardless of hash",
+			candidates: []string{"edge-a", "edge-b", "worker-a", "worker-b"},
+			ip:         "10.20.30.1",
+			scores:     map[string]int64{"edge-a": 100},
+			want:       []string{"edge-a", "edge-b", "worker-a", "worker-b"},
+		},
+		{
+			desc:       "equal non-zero scores fall through to hash",
+			candidates: []string{"node-a", "node-b"},
+			ip:         "10.20.30.1",
+			scores:     map[string]int64{"node-a": 100, "node-b": 100},
+			want:       []string{"node-b", "node-a"},
+		},
+		{
+			desc:       "preferred group sorted by hash, unpreferred trail",
+			candidates: []string{"edge-a", "edge-b", "worker-a"},
+			ip:         "10.20.30.1",
+			scores:     map[string]int64{"edge-a": 100, "edge-b": 100},
+			want:       []string{"edge-b", "edge-a", "worker-a"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			// Sort an unrelated permutation to confirm output is determined
+			// by score+hash, not input order.
+			permuted := slices.Clone(test.candidates)
+			for i := range permuted {
+				j := (i + 1) % len(permuted)
+				permuted[i], permuted[j] = permuted[j], permuted[i]
+			}
+			sortL2Candidates(permuted, test.ip, test.scores)
+			if !slices.Equal(permuted, test.want) {
+				t.Fatalf("sortL2Candidates(%v, %q, %v) = %v, want %v",
+					test.candidates, test.ip, test.scores, permuted, test.want)
+			}
+		})
+	}
+}
+
+func TestPreferredScoresFor(t *testing.T) {
+	tests := []struct {
+		desc string
+		ads  []*config.L2Advertisement
+		want map[string]int64
+	}{
+		{
+			desc: "nil ads",
+		},
+		{
+			desc: "ads without preferences",
+			ads:  []*config.L2Advertisement{{Nodes: map[string]bool{"a": true}}},
+		},
+		{
+			desc: "preferences across ads sum",
+			ads: []*config.L2Advertisement{
+				{Nodes: map[string]bool{"a": true, "b": true}, PreferredNodes: map[string]int64{"a": 70}},
+				{Nodes: map[string]bool{"a": true, "b": true}, PreferredNodes: map[string]int64{"a": 30, "b": 50}},
+			},
+			want: map[string]int64{"a": 100, "b": 50},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			got := preferredScoresFor(tc.ads)
+			if len(got) != len(tc.want) {
+				t.Fatalf("size mismatch: want %d got %d (%v)", len(tc.want), len(got), got)
+			}
+			for k, v := range tc.want {
+				if got[k] != v {
+					t.Fatalf("score[%s]: want %d got %d", k, v, got[k])
+				}
+			}
+		})
+	}
+}
+
+func TestShouldAnnouncePreferredNode(t *testing.T) {
+	lbIP := net.ParseIP("10.20.30.1")
+
+	tests := []struct {
+		desc       string
+		speakerMap map[string]bool
+		svc        *v1.Service
+		eps        []discovery.EndpointSlice
+		ad         *config.L2Advertisement
+		wantWinner string
+	}{
+		{
+			desc:       "preferred node with highest score wins",
+			speakerMap: map[string]bool{"edge-a": true, "edge-b": true, "worker-a": true, "worker-b": true},
+			svc: &v1.Service{
+				Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			eps: []discovery.EndpointSlice{{
+				Endpoints: []discovery.Endpoint{{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("worker-a"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				}},
+			}},
+			ad: &config.L2Advertisement{
+				Nodes:          map[string]bool{"edge-a": true, "edge-b": true, "worker-a": true, "worker-b": true},
+				PreferredNodes: map[string]int64{"edge-a": 100},
+				AllInterfaces:  true,
+			},
+			wantWinner: "edge-a",
+		},
+		{
+			// ETP:Local drops nodes without local ready endpoints before preference
+			// scoring. A preferred node without endpoints must lose to an unpreferred
+			// node that has them.
+			desc:       "ETP Local drops preferred node without local endpoints",
+			speakerMap: map[string]bool{"preferred-a": true, "worker-a": true},
+			svc: &v1.Service{
+				Spec: v1.ServiceSpec{
+					Type:                  "LoadBalancer",
+					ExternalTrafficPolicy: v1.ServiceExternalTrafficPolicyTypeLocal,
+				},
+				Status: statusAssigned("10.20.30.1"),
+			},
+			eps: []discovery.EndpointSlice{{
+				Endpoints: []discovery.Endpoint{{
+					Addresses:  []string{"2.3.4.5"},
+					NodeName:   ptr.To("worker-a"),
+					Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+				}},
+			}},
+			ad: &config.L2Advertisement{
+				Nodes:          map[string]bool{"preferred-a": true, "worker-a": true},
+				PreferredNodes: map[string]int64{"preferred-a": 100},
+				AllInterfaces:  true,
+			},
+			wantWinner: "worker-a",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := &config.Config{
+				Pools: &config.Pools{ByName: map[string]*config.Pool{
+					"default": {
+						CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+						L2Advertisements: []*config.L2Advertisement{tc.ad},
+					},
+				}},
+			}
+			nodes := map[string]*v1.Node{}
+			for n := range tc.speakerMap {
+				nodes[n] = &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: n}}
+			}
+			fakeSL := &fakeSpeakerList{speakers: tc.speakerMap}
+			l := log.NewNopLogger()
+			var winners []string
+			for nodeName := range tc.speakerMap {
+				c, err := newController(controllerConfig{
+					MyNode:  nodeName,
+					Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+					SList:   fakeSL,
+					bgpType: bgpNative,
+				})
+				if err != nil {
+					t.Fatalf("new controller: %s", err)
+				}
+				c.client = &testK8S{t: t}
+				if c.SetConfig(l, cfg) == controllers.SyncStateError {
+					t.Fatalf("SetConfig failed")
+				}
+				if c.protocolHandlers[config.Layer2].ShouldAnnounce(l, "svc1", []net.IP{lbIP}, cfg.Pools.ByName["default"], tc.svc, tc.eps, nodes) == "" {
+					winners = append(winners, nodeName)
+				}
+			}
+			if len(winners) != 1 {
+				t.Fatalf("expected exactly one announcer, got %d: %v", len(winners), winners)
+			}
+			if winners[0] != tc.wantWinner {
+				t.Fatalf("expected %q to announce, got %q", tc.wantWinner, winners[0])
+			}
+		})
+	}
+}
+
+func TestShouldAnnounceSplitBrainWithMixedAds(t *testing.T) {
+	// Ad1 covers edges and carries the preference. Ad2 covers everyone with none.
+	// If scoring used a node-filtered ad set, worker speakers would disagree with
+	// edge speakers. The adPoison ad has ServiceSelectors that must not match svc.
+	// Otherwise worker-a's 1000 would outscore edge-a's 100.
+	speakerMap := map[string]bool{"edge-a": true, "worker-a": true}
+	adEdge := &config.L2Advertisement{
+		Nodes:          map[string]bool{"edge-a": true},
+		PreferredNodes: map[string]int64{"edge-a": 100},
+		AllInterfaces:  true,
+	}
+	adAll := &config.L2Advertisement{
+		Nodes:         map[string]bool{"edge-a": true, "worker-a": true},
+		AllInterfaces: true,
+	}
+	adPoison := &config.L2Advertisement{
+		Nodes:            map[string]bool{"edge-a": true, "worker-a": true},
+		PreferredNodes:   map[string]int64{"worker-a": 1000},
+		ServiceSelectors: []labels.Selector{selector("app=does-not-match")},
+		AllInterfaces:    true,
+	}
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: []*config.L2Advertisement{adEdge, adAll, adPoison},
+			},
+		}},
+	}
+	svc := &v1.Service{
+		Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+		Status: statusAssigned("10.20.30.1"),
+	}
+	eps := []discovery.EndpointSlice{{
+		Endpoints: []discovery.Endpoint{{
+			Addresses:  []string{"2.3.4.5"},
+			NodeName:   ptr.To("worker-a"),
+			Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}}
+	nodes := map[string]*v1.Node{
+		"edge-a":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-a"}},
+		"worker-a": {ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+	}
+	fakeSL := &fakeSpeakerList{speakers: speakerMap}
+	l := log.NewNopLogger()
+	lbIP := net.ParseIP("10.20.30.1")
+	var winners []string
+	for nodeName := range speakerMap {
+		c, err := newController(controllerConfig{
+			MyNode:  nodeName,
+			Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+			SList:   fakeSL,
+			bgpType: bgpNative,
+		})
+		if err != nil {
+			t.Fatalf("new controller: %s", err)
+		}
+		c.client = &testK8S{t: t}
+		if c.SetConfig(l, cfg) == controllers.SyncStateError {
+			t.Fatalf("SetConfig failed")
+		}
+		if c.protocolHandlers[config.Layer2].ShouldAnnounce(l, "svc1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc, eps, nodes) == "" {
+			winners = append(winners, nodeName)
+		}
+	}
+	if len(winners) != 1 || winners[0] != "edge-a" {
+		t.Fatalf("edge-a must win due to preference score; got %v", winners)
+	}
+}
+
+func TestShouldAnnouncePreferredNodeFailover(t *testing.T) {
+	// Three failover stages: preferred node pruned, preferred node returns,
+	// all preferred unavailable. Each stage swaps the speakerMap and re-elects.
+	lbIP := net.ParseIP("10.20.30.1")
+	ad := &config.L2Advertisement{
+		Nodes: map[string]bool{
+			"edge-a":   true,
+			"edge-b":   true,
+			"worker-a": true,
+		},
+		PreferredNodes: map[string]int64{
+			"edge-a": 100,
+			"edge-b": 100,
+		},
+		AllInterfaces: true,
+	}
+	cfg := &config.Config{
+		Pools: &config.Pools{ByName: map[string]*config.Pool{
+			"default": {
+				CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+				L2Advertisements: []*config.L2Advertisement{ad},
+			},
+		}},
+	}
+	svc := &v1.Service{
+		Spec:   v1.ServiceSpec{Type: "LoadBalancer"},
+		Status: statusAssigned("10.20.30.1"),
+	}
+	eps := []discovery.EndpointSlice{{
+		Endpoints: []discovery.Endpoint{{
+			Addresses:  []string{"2.3.4.5"},
+			NodeName:   ptr.To("worker-a"),
+			Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}}
+	allNodes := map[string]*v1.Node{
+		"edge-a":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-a"}},
+		"edge-b":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-b"}},
+		"worker-a": {ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+	}
+
+	elect := func(t *testing.T, cfg *config.Config, eps []discovery.EndpointSlice, speakerMap map[string]bool, nodes map[string]*v1.Node) []string {
+		t.Helper()
+		fakeSL := &fakeSpeakerList{speakers: speakerMap}
+		l := log.NewNopLogger()
+		var winners []string
+		for nodeName := range speakerMap {
+			c, err := newController(controllerConfig{
+				MyNode:  nodeName,
+				Logger:  log.NewLogfmtLogger(log.NewSyncWriter(os.Stderr)),
+				SList:   fakeSL,
+				bgpType: bgpNative,
+			})
+			if err != nil {
+				t.Fatalf("new controller: %s", err)
+			}
+			c.client = &testK8S{t: t}
+			if c.SetConfig(l, cfg) == controllers.SyncStateError {
+				t.Fatalf("SetConfig failed")
+			}
+			if c.protocolHandlers[config.Layer2].ShouldAnnounce(l, "svc1", []net.IP{lbIP}, cfg.Pools.ByName["default"], svc, eps, nodes) == "" {
+				winners = append(winners, nodeName)
+			}
+		}
+		return winners
+	}
+
+	t.Run("preferred node pruned leaves remaining preferred as winner", func(t *testing.T) {
+		speakerMap := map[string]bool{"edge-b": true, "worker-a": true}
+		winners := elect(t, cfg, eps, speakerMap, allNodes)
+		if len(winners) != 1 || winners[0] != "edge-b" {
+			t.Fatalf("expected edge-b (remaining preferred) to announce, got %v", winners)
+		}
+	})
+
+	t.Run("preferred node returns and reclaims via sha256 tie-break", func(t *testing.T) {
+		speakerMap := map[string]bool{"edge-a": true, "edge-b": true, "worker-a": true}
+		// edge-a and edge-b tie on score (100); the hash tie-break picks edge-b
+		// (verified independently in TestSortL2Candidates).
+		winners := elect(t, cfg, eps, speakerMap, allNodes)
+		if len(winners) != 1 || winners[0] != "edge-b" {
+			t.Fatalf("expected sha256 tie-break winner edge-b among preferred nodes, got %v", winners)
+		}
+	})
+
+	t.Run("all preferred unavailable falls through to hash across zero-score survivors", func(t *testing.T) {
+		speakerMap := map[string]bool{"worker-a": true, "worker-b": true}
+		adAllWorkers := &config.L2Advertisement{
+			Nodes: map[string]bool{
+				"edge-a":   true,
+				"edge-b":   true,
+				"worker-a": true,
+				"worker-b": true,
+			},
+			PreferredNodes: map[string]int64{
+				"edge-a": 100,
+				"edge-b": 100,
+			},
+			AllInterfaces: true,
+		}
+		cfgWorkers := &config.Config{
+			Pools: &config.Pools{ByName: map[string]*config.Pool{
+				"default": {
+					CIDR:             []*net.IPNet{ipnet("10.20.30.0/24")},
+					L2Advertisements: []*config.L2Advertisement{adAllWorkers},
+				},
+			}},
+		}
+		workerEps := []discovery.EndpointSlice{{
+			Endpoints: []discovery.Endpoint{{
+				Addresses:  []string{"2.3.4.5"},
+				NodeName:   ptr.To("worker-a"),
+				Conditions: discovery.EndpointConditions{Ready: ptr.To(true)},
+			}},
+		}}
+		nodes := map[string]*v1.Node{
+			"edge-a":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-a"}},
+			"edge-b":   {ObjectMeta: metav1.ObjectMeta{Name: "edge-b"}},
+			"worker-a": {ObjectMeta: metav1.ObjectMeta{Name: "worker-a"}},
+			"worker-b": {ObjectMeta: metav1.ObjectMeta{Name: "worker-b"}},
+		}
+		// worker-a and worker-b both have score 0; hash tie-break picks worker-a
+		// (verified independently in TestSortL2Candidates).
+		winners := elect(t, cfgWorkers, workerEps, speakerMap, nodes)
+		if len(winners) != 1 || winners[0] != "worker-a" {
+			t.Fatalf("expected sha256 winner worker-a among zero-score survivors, got %v", winners)
+		}
+	})
 }

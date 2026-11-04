@@ -39,8 +39,10 @@ inv dev-env-cleanup
 
 * Go 1.15+
 * Python 3
+* Docker
 * [KIND - Kubernetes in Docker](https://kind.sigs.k8s.io/docs/user/quick-start/)
 * [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/)
+* [controller-gen](https://book.kubebuilder.io/reference/controller-gen.html)
 
 You may install the required python modules using the `requirements.txt` in this directory, with:
 
@@ -51,6 +53,8 @@ pip install -r requirements.txt
 ## Using the development environment
 
 ### BGP
+
+#### IPv4 unicast
 
 This assumes a 3-node `kind` based test cluster as set up by running `inv
 dev-env -p bgp`, which sets up the development environment with some
@@ -146,6 +150,50 @@ Commercial support is available at
 </html>
 ```
 
+#### IPv6 unicast
+
+Bring up the cluster using ipv6 address family
+```
+inv dev-env -i ipv6 -p bgp -b frr
+```
+
+Observe that BGP speakers have BGP sessions with our router:
+```
+docker exec frr vtysh -c "show bgp ipv6 unicast sum"
+BGP router identifier 172.18.0.5, local AS number 64512 vrf-id 0
+BGP table version 1
+RIB entries 1, using 192 bytes of memory
+Peers 3, using 43 KiB of memory
+Neighbor              V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt
+fc00:f853:ccd:e793::2 4      64512        25        24        0    0    0 00:21:05            1        0
+fc00:f853:ccd:e793::3 4      64512        25        24        0    0    0 00:21:04            1        0
+fc00:f853:ccd:e793::4 4      64512        25        24        0    0    0 00:21:05            1        0
+Total number of neighbors 3
+```
+
+Create IPv6 `nginx` service of type LoadBalancer
+
+```
+kubectl apply -f dev-env/testsvc_ipv6.yaml
+kubectl get svc
+NAME         TYPE           CLUSTER-IP         EXTERNAL-IP            PORT(S)        AGE
+kubernetes   ClusterIP      fd00:10:96::1      <none>                 443/TCP        15h
+nginx        LoadBalancer   fd00:10:96::d362   fc00:f853:ccd:e799::   80:32587/TCP   15h
+```
+
+Ensure a route to this service has been published by MetalLB BGP speaker
+
+```
+kubectl exec -it speaker-c9fx8 -n metallb-system -c frr -- vtysh -c "show bgp ipv6 unicast sum"
+BGP router identifier 172.18.0.2, local AS number 64512 vrf-id 0
+BGP table version 1
+RIB entries 1, using 192 bytes of memory
+Peers 1, using 14 KiB of memory
+Neighbor              V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt
+fc00:f853:ccd:e793::5 4      64512        27        29        0    0    0 00:21:55            0        1
+Total number of neighbors 1
+```
+
 ## Layer 2
 
 This assumes a 3-node `kind` based test cluster as set up by running `inv
@@ -198,4 +246,15 @@ Commercial support is available at
 <p><em>Thank you for using nginx.</em></p>
 </body>
 </html>
+```
+
+## Enabling the apiserver audit logs
+
+To enable the apiserver audit logs, to understand what are the impacts of the controller and the speakers over
+the apiserver, the `-t, --with-api-audit` flag must be passed to `inv dev-env`.
+
+When the audit logs are enabled, they can be inspected by running:
+
+```bash
+docker exec kind-control-plane cat /var/log/kubernetes/kube-apiserver-audit.log
 ```

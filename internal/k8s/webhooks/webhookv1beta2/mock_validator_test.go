@@ -1,0 +1,35 @@
+// SPDX-License-Identifier:Apache-2.0
+
+package webhookv1beta2
+
+import (
+	"errors"
+
+	"go.universe.tf/metallb/api/v1beta2"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type mockValidator struct {
+	bgpPeers   *v1beta2.BGPPeerList
+	nodes      *corev1.NodeList
+	forceError bool
+}
+
+func (m *mockValidator) Validate(objects ...client.ObjectList) error {
+	for _, obj := range objects {
+		switch list := obj.(type) {
+		case *v1beta2.BGPPeerList:
+			m.bgpPeers = list
+		case *corev1.NodeList:
+			m.nodes = list
+		default:
+			panic("unexpected type")
+		}
+	}
+
+	if m.forceError {
+		return errors.New("error!")
+	}
+	return nil
+}

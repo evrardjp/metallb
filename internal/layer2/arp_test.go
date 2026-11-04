@@ -1,3 +1,5 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package layer2
 
 import (
@@ -6,7 +8,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/google/go-cmp/cmp"
 	"github.com/mdlayher/arp"
 	"github.com/mdlayher/ethernet"
@@ -42,7 +44,7 @@ func TestARPResponder(t *testing.T) {
 		},
 		{
 			name: "shouldAnnounce denies request",
-			shouldAnnounce: func(ip net.IP) dropReason {
+			shouldAnnounce: func(ip net.IP, intf string) dropReason {
 				if net.IPv4(192, 168, 1, 20).Equal(ip) {
 					return dropReasonNone
 				}
@@ -53,7 +55,7 @@ func TestARPResponder(t *testing.T) {
 		{
 			name:   "shouldAnnounce allows request",
 			arpTgt: net.IPv4(192, 168, 1, 20),
-			shouldAnnounce: func(ip net.IP) dropReason {
+			shouldAnnounce: func(ip net.IP, intf string) dropReason {
 				if net.IPv4(192, 168, 1, 20).Equal(ip) {
 					return dropReasonNone
 				}
@@ -67,7 +69,7 @@ func TestARPResponder(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			shouldAnnounce := tt.shouldAnnounce
 			if shouldAnnounce == nil {
-				shouldAnnounce = func(net.IP) dropReason {
+				shouldAnnounce = func(net.IP, string) dropReason {
 					return dropReasonNone
 				}
 			}
@@ -125,7 +127,7 @@ func mustMarshal(m encoding.BinaryMarshaler) []byte {
 	return b
 }
 
-func newTestARP(t *testing.T, shouldAnnounce announceFunc) (*arpResponder, *net.UDPConn, func()) {
+func newTestARP(t *testing.T, shouldAnnounce announceFunc) (*arpClient, *net.UDPConn, func()) {
 	pc, err := net.ListenPacket("udp", "localhost:0")
 	if err != nil {
 		t.Fatalf("failed to listen UDP: %s", err)
@@ -143,7 +145,7 @@ func newTestARP(t *testing.T, shouldAnnounce announceFunc) (*arpResponder, *net.
 	// Find any interface that has a hardware address. We don't care
 	// which one, we just need something to satisfy the various
 	// interfaces.
-	var a *arpResponder
+	var a *arpClient
 	for _, intf := range intfs {
 		if intf.HardwareAddr == nil {
 			continue
@@ -155,7 +157,7 @@ func newTestARP(t *testing.T, shouldAnnounce announceFunc) (*arpResponder, *net.
 			t.Fatalf("failed to create ARP client: %s", err)
 		}
 
-		a = &arpResponder{
+		a = &arpClient{
 			logger:       log.NewNopLogger(),
 			hardwareAddr: intf.HardwareAddr,
 			conn:         c,

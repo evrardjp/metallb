@@ -8,21 +8,19 @@ MetalLB is currently in *beta*.
 ## Adoption
 
 MetalLB is being used in several production and non-production clusters, by
-several people and companies. Based on the infrequency of bug reports, MetalLB
-appears to be robust in those deployments.
+several people and companies. It is bundled together with the major
+Kubernetes distributions for on premise deployments.
+Based on the infrequency of bug reports, MetalLB appears to be robust in those deployments.
 
-If you use it today, you are still an early adopter, compared to larger projects
-in the Kubernetes ecosystem. As such, you may encounter more issues than
-usual. Please file bugs! We want to hear from you and address pain points.
+In any case, no one is perfect and issues might happen.
+Please file bugs! We want to hear from you and address pain points.
 
 ## Test coverage
 
-The codebase has reasonable test coverage, but lacks comprehensive
-end-to-end tests. Empirical testing, combined with the unit tests we
-have, show that the common codepaths work properly, but edge cases may
-have bugs.
-
-Increasing test coverage is an active area of work.
+The codebase has reasonable test coverage, and a good amount of
+end-to-end tests which covers against most part of regressions.
+Despite that, edge cases may have bugs, so if you find unexpected
+behaviours, please consider [filing an issue](https://github.com/metallb/metallb/issues).
 
 ## Configuration format
 
@@ -38,6 +36,12 @@ old configuration format.
 Release notes during beta will highlight any required changes to configuration
 when upgrading between versions, and give advance warning of removals planned
 for the following version.
+
+## Kubernetes compatibility
+
+The MetalLB maintainers aim to keep compatibility with the supported versions
+of Kubernetes. If a kubernetes version is not supported anymore, the compatibility is
+provided on best effort basis.
 
 ## Documentation
 

@@ -1,315 +1,404 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package k8s // import "go.universe.tf/metallb/internal/k8s"
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"net/http"
+	"os"
+
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	metallbv1beta1 "go.universe.tf/metallb/api/v1beta1"
+	metallbv1beta2 "go.universe.tf/metallb/api/v1beta2"
 
 	"go.universe.tf/metallb/internal/config"
+	"go.universe.tf/metallb/internal/k8s/controllers"
+	"go.universe.tf/metallb/internal/k8s/epslices"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1beta1"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	frrv1beta1 "github.com/metallb/frr-k8s/api/v1beta1"
+	discovery "k8s.io/api/discovery/v1"
+	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
-	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/workqueue"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apiext "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+
+	ctrl "sigs.k8s.io/controller-runtime"
 )
+
+const (
+	DefaultHealthProbePort = 17472
+
+	caName          = "cert"
+	caOrganization  = "metallb"
+	MLSecretKeyName = "secretkey"
+)
+
+var (
+	scheme                      = runtime.NewScheme()
+	setupLog                    = ctrl.Log.WithName("setup")
+	validatingWebhookName       = "metallb-webhook-configuration"
+	bgppeerConvertingWebhookCRD = "bgppeers.metallb.io"
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+
+	utilruntime.Must(metallbv1beta1.AddToScheme(scheme))
+	utilruntime.Must(metallbv1beta2.AddToScheme(scheme))
+
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(appsv1.AddToScheme(scheme))
+	utilruntime.Must(policyv1beta1.AddToScheme(scheme))
+	utilruntime.Must(rbacv1.AddToScheme(scheme))
+	utilruntime.Must(apiext.AddToScheme(scheme))
+	utilruntime.Must(discovery.AddToScheme(scheme))
+	utilruntime.Must(frrv1beta1.AddToScheme(scheme))
+
+	// +kubebuilder:scaffold:scheme
+}
+
+func metricsBindAddress(port int) string {
+	if port == 0 {
+		return "0"
+	}
+	return fmt.Sprintf("0.0.0.0:%d", port)
+}
 
 // Client watches a Kubernetes cluster and translates events into
 // Controller method calls.
 type Client struct {
 	logger log.Logger
 
-	client *kubernetes.Clientset
-	events record.EventRecorder
-	queue  workqueue.RateLimitingInterface
-
-	svcIndexer     cache.Indexer
-	svcInformer    cache.Controller
-	epIndexer      cache.Indexer
-	epInformer     cache.Controller
-	slicesIndexer  cache.Indexer
-	slicesInformer cache.Controller
-	cmIndexer      cache.Indexer
-	cmInformer     cache.Controller
-	nodeIndexer    cache.Indexer
-	nodeInformer   cache.Controller
-
-	syncFuncs []cache.InformerSynced
-
-	serviceChanged func(log.Logger, string, *v1.Service, EpsOrSlices) SyncState
-	configChanged  func(log.Logger, *config.Config) SyncState
-	nodeChanged    func(log.Logger, *v1.Node) SyncState
-	synced         func(log.Logger)
+	client           *kubernetes.Clientset
+	events           record.EventRecorder
+	mgr              manager.Manager
+	validateConfig   config.Validate
+	ForceSync        func()
+	BGPEventCallback func(interface{})
 }
-
-// SyncState is the result of calling synchronization callbacks.
-type SyncState int
-
-const (
-	// The update was processed successfully.
-	SyncStateSuccess SyncState = iota
-	// The update caused a transient error, the k8s client should
-	// retry later.
-	SyncStateError
-	// The update was accepted, but requires reprocessing all watched
-	// services.
-	SyncStateReprocessAll
-)
 
 // Config specifies the configuration of the Kubernetes
 // client/watcher.
 type Config struct {
-	ProcessName     string
-	ConfigMapName   string
-	ConfigMapNS     string
-	NodeName        string
-	MetricsHost     string
-	MetricsPort     int
-	ReadEndpoints   bool
-	Logger          log.Logger
-	Kubeconfig      string
-	DisableEpSlices bool
-
-	ServiceChanged func(log.Logger, string, *v1.Service, EpsOrSlices) SyncState
-	ConfigChanged  func(log.Logger, *config.Config) SyncState
-	NodeChanged    func(log.Logger, *v1.Node) SyncState
-	Synced         func(log.Logger)
+	ProcessName             string
+	NodeName                string
+	PodName                 string
+	MetricsPort             int
+	PprofBindAddress        string
+	HealthProbeBindAddress  string
+	ReadEndpoints           bool
+	Logger                  log.Logger
+	Namespace               string
+	ValidateConfig          config.Validate
+	EnableWebhook           bool
+	TLSOpt                  func(*tls.Config)
+	DisableCertRotation     bool
+	MetricsCertDir          string
+	WebhookSecretName       string
+	CertDir                 string
+	CertServiceName         string
+	LoadBalancerClass       string
+	WebhookWithHTTP2        bool
+	WithFRRK8s              bool
+	FRRK8sNamespace         string
+	FRRK8sSecretPassthrough bool
+	Listener
+	Layer2StatusChan    <-chan event.GenericEvent
+	Layer2StatusFetcher controllers.L2StatusFetcher
+	BGPStatusChan       <-chan event.GenericEvent
+	BGPPeersFetcher     controllers.PeersForService
+	PoolStatusChan      <-chan event.GenericEvent
+	PoolCountersFetcher controllers.PoolCountersFetcher
 }
-
-type svcKey string
-type cmKey string
-type nodeKey string
-type synced string
-
-const slicesServiceIndexName = "ServiceName"
 
 // New connects to masterAddr, using kubeconfig to authenticate.
 //
 // The client uses processName to identify itself to the cluster
 // (e.g. when logging events).
-//nolint:godot
 func New(cfg *Config) (*Client, error) {
-	var (
-		k8sConfig *rest.Config
-		err       error
-	)
+	namespaceSelector := cache.ByObject{
+		Field: fields.ParseSelectorOrDie(fmt.Sprintf("metadata.namespace=%s", cfg.Namespace)),
+	}
 
-	if cfg.Kubeconfig == "" {
-		// if the user didn't provide a config file, assume that we're
-		// running inside k8s.
-		k8sConfig, err = rest.InClusterConfig()
-	} else {
-		// the user provided a config file, so use that.  InClusterConfig
-		// would also work in this case but it emits an annoying warning.
-		k8sConfig, err = clientcmd.BuildConfigFromFlags("", cfg.Kubeconfig)
+	objectsPerNamespace := map[client.Object]cache.ByObject{
+		&metallbv1beta1.BFDProfile{}:       namespaceSelector,
+		&metallbv1beta1.BGPAdvertisement{}: namespaceSelector,
+		&metallbv1beta1.BGPPeer{}:          namespaceSelector,
+		&metallbv1beta1.IPAddressPool{}:    namespaceSelector,
+		&metallbv1beta1.L2Advertisement{}:  namespaceSelector,
+		&metallbv1beta2.BGPPeer{}:          namespaceSelector,
+		&metallbv1beta1.Community{}:        namespaceSelector,
+		&metallbv1beta1.ServiceBGPStatus{}: namespaceSelector,
+		&corev1.Secret{}:                   namespaceSelector,
+		&corev1.ConfigMap{}:                namespaceSelector,
 	}
+
+	metricsOpts := metricsserver.Options{
+		BindAddress:    metricsBindAddress(cfg.MetricsPort),
+		SecureServing:  true,
+		FilterProvider: filters.WithAuthenticationAndAuthorization,
+		CertDir:        cfg.MetricsCertDir,
+		TLSOpts:        []func(*tls.Config){cfg.TLSOpt},
+	}
+
+	mgrOpts := ctrl.Options{
+		Scheme:                 scheme,
+		LeaderElection:         false,
+		Cache:                  cache.Options{ByObject: objectsPerNamespace},
+		WebhookServer:          webhookServer(cfg),
+		Metrics:                metricsOpts,
+		HealthProbeBindAddress: cfg.HealthProbeBindAddress,
+		PprofBindAddress:       cfg.PprofBindAddress,
+	}
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
 	if err != nil {
-		return nil, fmt.Errorf("building client config: %s", err)
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
 	}
-	clientset, err := kubernetes.NewForConfig(k8sConfig)
+	clientset, err := kubernetes.NewForConfig(mgr.GetConfig())
 	if err != nil {
 		return nil, fmt.Errorf("creating Kubernetes client: %s", err)
 	}
 
-	broadcaster := record.NewBroadcaster()
-	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: v1core.New(clientset.CoreV1().RESTClient()).Events("")})
-	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: cfg.ProcessName})
+	recorder := mgr.GetEventRecorderFor(cfg.ProcessName) //nolint:staticcheck // TODO: migrate to GetEventRecorder
 
-	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
-
-	c := &Client{
-		logger: cfg.Logger,
-		client: clientset,
-		events: recorder,
-		queue:  queue,
+	reloadChan := make(chan event.GenericEvent)
+	reload := func() {
+		reloadChan <- controllers.NewReloadEvent()
 	}
 
-	if cfg.ServiceChanged != nil {
-		svcHandlers := cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(obj)
-				if err == nil {
-					c.queue.Add(svcKey(key))
-				}
-			},
-			UpdateFunc: func(old interface{}, new interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(new)
-				if err == nil {
-					c.queue.Add(svcKey(key))
-				}
-			},
-			DeleteFunc: func(obj interface{}) {
-				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				if err == nil {
-					c.queue.Add(svcKey(key))
-				}
-			},
-		}
-		svcWatcher := cache.NewListWatchFromClient(c.client.CoreV1().RESTClient(), "services", v1.NamespaceAll, fields.Everything())
-		c.svcIndexer, c.svcInformer = cache.NewIndexerInformer(svcWatcher, &v1.Service{}, 0, svcHandlers, cache.Indexers{})
+	c := &Client{
+		logger:         cfg.Logger,
+		client:         clientset,
+		events:         recorder,
+		mgr:            mgr,
+		validateConfig: cfg.ValidateConfig,
+		ForceSync:      reload,
+	}
 
-		c.serviceChanged = cfg.ServiceChanged
-		c.syncFuncs = append(c.syncFuncs, c.svcInformer.HasSynced)
+	selfPod, err := clientset.CoreV1().Pods(cfg.Namespace).Get(context.TODO(), cfg.PodName, metav1.GetOptions{})
+	if err != nil {
+		level.Error(cfg.Logger).Log("op", "startup", "error", err, "msg", "unable to get own pod for owner references")
+		return nil, err
+	}
 
-		if cfg.ReadEndpoints {
-			// use DisableEpSlices to skip the autodiscovery mechanism. Useful if EndpointSlices are enabled in the cluster but disabled in kube-proxy
-			if cfg.DisableEpSlices || !UseEndpointSlices(c.client) {
-				epHandlers := cache.ResourceEventHandlerFuncs{
-					AddFunc: func(obj interface{}) {
-						key, err := cache.MetaNamespaceKeyFunc(obj)
-						if err == nil {
-							c.queue.Add(svcKey(key))
-						}
-					},
-					UpdateFunc: func(old interface{}, new interface{}) {
-						key, err := cache.MetaNamespaceKeyFunc(new)
-						if err == nil {
-							c.queue.Add(svcKey(key))
-						}
-					},
-					DeleteFunc: func(obj interface{}) {
-						key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-						if err == nil {
-							c.queue.Add(svcKey(key))
-						}
-					},
-				}
-				epWatcher := cache.NewListWatchFromClient(c.client.CoreV1().RESTClient(), "endpoints", v1.NamespaceAll, fields.Everything())
-				c.epIndexer, c.epInformer = cache.NewIndexerInformer(epWatcher, &v1.Endpoints{}, 0, epHandlers, cache.Indexers{})
+	configStateName := "controller"
+	configStateLabels := map[string]string{
+		"metallb.io/component-type": "controller",
+	}
 
-				c.syncFuncs = append(c.syncFuncs, c.epInformer.HasSynced)
-			} else {
-				level.Info(c.logger).Log("op", "New", "msg", "using endpoint slices")
-				slicesHandlers := cache.ResourceEventHandlerFuncs{
-					AddFunc: func(obj interface{}) {
-						slice, ok := obj.(*discovery.EndpointSlice)
-						if !ok {
-							level.Error(c.logger).Log("op", "SliceAdd", "error", "received a non EndpointSlice item")
-							return
-						}
-
-						key, err := serviceKeyForSlice(slice)
-						if err != nil {
-							return
-						}
-						c.queue.Add(key)
-					},
-					UpdateFunc: func(old interface{}, new interface{}) {
-						slice, ok := new.(*discovery.EndpointSlice)
-						if !ok {
-							level.Error(c.logger).Log("op", "SliceUpdate", "error", "received a non EndpointSlice item")
-							return
-						}
-						key, err := serviceKeyForSlice(slice)
-						if err != nil {
-							level.Error(c.logger).Log("op", "SliceUpdate", "error", "failed to get serviceKey for slice", "slice", slice.Name)
-							return
-						}
-						c.queue.Add(key)
-					},
-					DeleteFunc: func(obj interface{}) {
-						slice, ok := obj.(*discovery.EndpointSlice)
-						if !ok {
-							level.Error(c.logger).Log("op", "SliceDelete", "error", "received a non EndpointSlice item")
-							return
-						}
-						key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(slice)
-						if err != nil {
-							level.Error(c.logger).Log("op", "SliceDelete", "error", err)
-							return
-						}
-						c.queue.Add(svcKey(key))
-					},
-				}
-				slicesWatcher := cache.NewListWatchFromClient(c.client.DiscoveryV1beta1().RESTClient(), "endpointslices", v1.NamespaceAll, fields.Everything())
-				c.slicesIndexer, c.slicesInformer = cache.NewIndexerInformer(slicesWatcher, &discovery.EndpointSlice{}, 0, slicesHandlers, cache.Indexers{
-					slicesServiceIndexName: slicesServiceIndex,
-				})
-				c.syncFuncs = append(c.syncFuncs, c.slicesInformer.HasSynced)
-			}
+	if cfg.ProcessName == "metallb-speaker" {
+		configStateName = "speaker-" + cfg.NodeName
+		configStateLabels = map[string]string{
+			"metallb.io/component-type": "speaker",
+			"metallb.io/node-name":      cfg.NodeName,
 		}
 	}
 
 	if cfg.ConfigChanged != nil {
-		cmHandlers := cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(obj)
-				if err == nil {
-					c.queue.Add(cmKey(key))
-				}
-			},
-			UpdateFunc: func(old interface{}, new interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(new)
-				if err == nil {
-					c.queue.Add(cmKey(key))
-				}
-			},
-			DeleteFunc: func(obj interface{}) {
-				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				if err == nil {
-					c.queue.Add(cmKey(key))
-				}
-			},
+		if err = (&controllers.ConfigReconciler{
+			Client:                  mgr.GetClient(),
+			ConfigStateName:         configStateName,
+			Logger:                  cfg.Logger,
+			Scheme:                  mgr.GetScheme(),
+			Namespace:               cfg.Namespace,
+			ValidateConfig:          cfg.ValidateConfig,
+			Handler:                 cfg.ConfigHandler,
+			ForceReload:             reload,
+			NodeName:                cfg.NodeName,
+			FRRK8sSecretPassthrough: cfg.FRRK8sSecretPassthrough,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "config")
+			return nil, errors.Join(err, errors.New("unable to create controller for config"))
 		}
-		cmWatcher := cache.NewListWatchFromClient(c.client.CoreV1().RESTClient(), "configmaps", cfg.ConfigMapNS, fields.OneTermEqualSelector("metadata.name", cfg.ConfigMapName))
-		c.cmIndexer, c.cmInformer = cache.NewIndexerInformer(cmWatcher, &v1.ConfigMap{}, 0, cmHandlers, cache.Indexers{})
+	}
 
-		c.configChanged = cfg.ConfigChanged
-		c.syncFuncs = append(c.syncFuncs, c.cmInformer.HasSynced)
+	if cfg.PoolChanged != nil {
+		if err = (&controllers.PoolReconciler{
+			Client:          mgr.GetClient(),
+			ConfigStateName: configStateName,
+			Logger:          cfg.Logger,
+			Scheme:          mgr.GetScheme(),
+			Namespace:       cfg.Namespace,
+			ValidateConfig:  cfg.ValidateConfig,
+			Handler:         cfg.PoolHandler,
+			ForceReload:     reload,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "config")
+			return nil, errors.Join(err, errors.New("failed to create config reconciler"))
+		}
+
+		if err = (&controllers.PoolStatusReconciler{
+			Client:          mgr.GetClient(),
+			Logger:          cfg.Logger,
+			CountersFetcher: cfg.PoolCountersFetcher,
+			ReconcileChan:   cfg.PoolStatusChan,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "config")
+			return nil, errors.Join(err, errors.New("failed to create pool status reconciler"))
+		}
 	}
 
 	if cfg.NodeChanged != nil {
-		nodeHandlers := cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(obj)
-				if err == nil {
-					c.queue.Add(nodeKey(key))
-				}
-			},
-			UpdateFunc: func(old interface{}, new interface{}) {
-				key, err := cache.MetaNamespaceKeyFunc(new)
-				if err == nil {
-					c.queue.Add(nodeKey(key))
-				}
-			},
-			DeleteFunc: func(obj interface{}) {
-				key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
-				if err == nil {
-					c.queue.Add(nodeKey(key))
-				}
-			},
+		if err = (&controllers.NodeReconciler{
+			Client:      mgr.GetClient(),
+			Logger:      cfg.Logger,
+			Scheme:      mgr.GetScheme(),
+			Handler:     cfg.NodeHandler,
+			NodeName:    cfg.NodeName,
+			ForceReload: reload,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "node")
+			return nil, errors.Join(err, errors.New("failed to create node reconciler"))
 		}
-		nodeWatcher := cache.NewListWatchFromClient(c.client.CoreV1().RESTClient(), "nodes", v1.NamespaceAll, fields.OneTermEqualSelector("metadata.name", cfg.NodeName))
-		c.nodeIndexer, c.nodeInformer = cache.NewIndexerInformer(nodeWatcher, &v1.Node{}, 0, nodeHandlers, cache.Indexers{})
-
-		c.nodeChanged = cfg.NodeChanged
-		c.syncFuncs = append(c.syncFuncs, c.nodeInformer.HasSynced)
 	}
 
-	if cfg.Synced != nil {
-		c.synced = cfg.Synced
+	if cfg.WithFRRK8s {
+		frrk8sController := controllers.FRRK8sReconciler{
+			Client:          mgr.GetClient(),
+			Logger:          cfg.Logger,
+			Scheme:          mgr.GetScheme(),
+			FRRK8sNamespace: cfg.FRRK8sNamespace,
+			NodeName:        cfg.NodeName,
+		}
+		if err := frrk8sController.SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "frrk8s")
+			return nil, errors.Join(err, errors.New("failed to create frrk8s reconciler"))
+		}
+		c.BGPEventCallback = frrk8sController.UpdateConfig
 	}
 
-	http.Handle("/metrics", promhttp.Handler())
+	if cfg.ReadEndpoints {
+		// Set a field indexer so we can retrieve all the endpoints for a given service.
+		if err := mgr.GetFieldIndexer().IndexField(context.Background(), &discovery.EndpointSlice{}, epslices.SlicesServiceIndexName, func(rawObj client.Object) []string {
+			epSlice, ok := rawObj.(*discovery.EndpointSlice)
+			if epSlice == nil {
+				level.Error(c.logger).Log("controller", "fieldindexer", "error", "received nil epslice")
+				return nil
+			}
+			if !ok {
+				level.Error(c.logger).Log("controller", "fieldindexer", "error", "received object that is not epslice", "object", rawObj.GetObjectKind().GroupVersionKind().Kind)
+				return nil
+			}
+			serviceKey, err := epslices.ServiceKeyForSlice(epSlice)
+			if err != nil {
+				level.Error(c.logger).Log("controller", "ServiceReconciler", "error", "failed to get service from epslices", "epslice", epSlice.Name, "error", err)
+			}
+			return []string{serviceKey.String()}
+		}); err != nil {
+			return nil, err
+		}
+	}
+
+	// Setup reconciler
+	cc := controllers.ConfigurationStateReconciler{
+		Client:            mgr.GetClient(),
+		Namespace:         cfg.Namespace,
+		ConfigStateName:   configStateName,
+		ConfigStateLabels: configStateLabels,
+		Logger:            cfg.Logger,
+		Scheme:            mgr.GetScheme(),
+		OwnerPod:          selfPod.DeepCopy(),
+	}
+	if err := cc.SetupWithManager(mgr); err != nil {
+		level.Error(c.logger).Log("error", err, "unable to create controller", "configurationstatus")
+		return nil, errors.Join(err, errors.New("failed to create configuration status reconciler"))
+	}
+
+	if cfg.ServiceChanged != nil {
+		if err = (&controllers.ServiceReconciler{
+			Client:            mgr.GetClient(),
+			Logger:            cfg.Logger,
+			Scheme:            mgr.GetScheme(),
+			Handler:           cfg.ServiceHandler,
+			Endpoints:         cfg.ReadEndpoints,
+			Reload:            reloadChan,
+			LoadBalancerClass: cfg.LoadBalancerClass,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "service")
+			return nil, errors.Join(err, errors.New("failed to create service reconciler"))
+		}
+	}
+
+	// metallb controller doesn't need this reconciler
+	if cfg.Layer2StatusChan != nil {
+		if err = (&controllers.Layer2StatusReconciler{
+			Client:        mgr.GetClient(),
+			Logger:        cfg.Logger,
+			NodeName:      cfg.NodeName,
+			Namespace:     cfg.Namespace,
+			SpeakerPod:    selfPod.DeepCopy(),
+			ReconcileChan: cfg.Layer2StatusChan,
+			StatusFetcher: cfg.Layer2StatusFetcher,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "layer2Status")
+		}
+	}
+
+	if cfg.BGPStatusChan != nil {
+		if err = (&controllers.ServiceBGPStatusReconciler{
+			Client:        mgr.GetClient(),
+			Logger:        cfg.Logger,
+			NodeName:      cfg.NodeName,
+			Namespace:     cfg.Namespace,
+			SpeakerPod:    selfPod.DeepCopy(),
+			ReconcileChan: cfg.BGPStatusChan,
+			PeersFetcher:  cfg.BGPPeersFetcher,
+		}).SetupWithManager(mgr); err != nil {
+			level.Error(c.logger).Log("error", err, "unable to create controller", "layer2Status")
+		}
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		return nil, errors.Join(err, errors.New("failed to set up health check"))
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return nil, errors.Join(err, errors.New("failed to set up ready check"))
+	}
+
+	startListeners := make(chan struct{})
 	go func(l log.Logger) {
-		err := http.ListenAndServe(fmt.Sprintf("%s:%d", cfg.MetricsHost, cfg.MetricsPort), nil)
-		if err != nil {
-			level.Error(l).Log("op", "listenAndServe", "err", err, "msg", "cannot listen and serve", "host", cfg.MetricsHost, "port", cfg.MetricsPort)
+		<-startListeners
+		if cfg.EnableWebhook {
+			err := enableWebhook(c.mgr, cfg.ValidateConfig, cfg.Namespace, cfg.Logger)
+			if err != nil {
+				level.Error(l).Log("error", err, "unable to create", "webhooks")
+			}
 		}
 	}(c.logger)
+
+	if cfg.EnableWebhook && !cfg.DisableCertRotation {
+		err = enableCertRotation(startListeners, cfg, mgr)
+		if err != nil {
+			return nil, errors.Join(err, errors.New("failed to enable cert rotation"))
+		}
+	} else {
+		close(startListeners)
+	}
 
 	return c, nil
 }
@@ -348,7 +437,7 @@ func (c *Client) CreateMlSecret(namespace, controllerDeploymentName, secretName 
 	// Create the K8S Secret object.
 	_, err = c.client.CoreV1().Secrets(namespace).Create(
 		context.TODO(),
-		&v1.Secret{
+		&corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: secretName,
 				OwnerReferences: []metav1.OwnerReference{{
@@ -360,11 +449,11 @@ func (c *Client) CreateMlSecret(namespace, controllerDeploymentName, secretName 
 					UID:  d.UID,
 				}},
 			},
-			Data: map[string][]byte{"secretkey": secretB64},
+			Data: map[string][]byte{MLSecretKeyName: secretB64},
 		},
 		metav1.CreateOptions{})
 	if err == nil {
-		level.Info(c.logger).Log("op", "CreateMlSecret", "msg", "secret succesfully created")
+		level.Info(c.logger).Log("op", "CreateMlSecret", "msg", "secret successfully created")
 	}
 	return err
 }
@@ -385,233 +474,46 @@ func (c *Client) PodIPs(namespace, labels string) ([]string, error) {
 // Run watches for events on the Kubernetes cluster, and dispatches
 // calls to the Controller.
 func (c *Client) Run(stopCh <-chan struct{}) error {
-	if c.svcInformer != nil {
-		go c.svcInformer.Run(stopCh)
-	}
-	if c.epInformer != nil {
-		go c.epInformer.Run(stopCh)
-	}
-	if c.slicesInformer != nil {
-		go c.slicesInformer.Run(stopCh)
-	}
-	if c.cmInformer != nil {
-		go c.cmInformer.Run(stopCh)
-	}
-	if c.nodeInformer != nil {
-		go c.nodeInformer.Run(stopCh)
+	ctx := ctrl.SetupSignalHandler()
+
+	level.Info(c.logger).Log("op", "Run", "msg", "Starting Manager")
+	if err := c.mgr.Start(ctx); err != nil {
+		return err
 	}
 
-	if !cache.WaitForCacheSync(stopCh, c.syncFuncs...) {
-		return errors.New("timed out waiting for cache sync")
-	}
-
-	c.queue.Add(synced(""))
-
-	if stopCh != nil {
-		go func() {
-			<-stopCh
-			c.queue.ShutDown()
-		}()
-	}
-
-	for {
-		key, quit := c.queue.Get()
-		if quit {
-			return nil
-		}
-		updates.Inc()
-		st := c.sync(key)
-		switch st {
-		case SyncStateSuccess:
-			c.queue.Forget(key)
-		case SyncStateError:
-			updateErrors.Inc()
-			c.queue.AddRateLimited(key)
-		case SyncStateReprocessAll:
-			c.queue.Forget(key)
-			c.ForceSync()
-		}
-	}
-}
-
-// ForceSync reprocess all watched services.
-func (c *Client) ForceSync() {
-	if c.svcIndexer != nil {
-		for _, k := range c.svcIndexer.ListKeys() {
-			c.queue.AddRateLimited(svcKey(k))
-		}
-	}
+	return nil
 }
 
 // UpdateStatus writes the protected "status" field of svc back into
 // the Kubernetes cluster.
-func (c *Client) UpdateStatus(svc *v1.Service) error {
+func (c *Client) UpdateStatus(svc *corev1.Service) error {
 	_, err := c.client.CoreV1().Services(svc.Namespace).UpdateStatus(context.TODO(), svc, metav1.UpdateOptions{})
 	return err
 }
 
 // Infof logs an informational event about svc to the Kubernetes cluster.
-func (c *Client) Infof(svc *v1.Service, kind, msg string, args ...interface{}) {
-	c.events.Eventf(svc, v1.EventTypeNormal, kind, msg, args...)
+func (c *Client) Infof(svc *corev1.Service, kind, msg string, args ...interface{}) {
+	c.events.Eventf(svc, corev1.EventTypeNormal, kind, msg, args...)
 }
 
 // Errorf logs an error event about svc to the Kubernetes cluster.
-func (c *Client) Errorf(svc *v1.Service, kind, msg string, args ...interface{}) {
-	c.events.Eventf(svc, v1.EventTypeWarning, kind, msg, args...)
+func (c *Client) Errorf(svc *corev1.Service, kind, msg string, args ...interface{}) {
+	c.events.Eventf(svc, corev1.EventTypeWarning, kind, msg, args...)
 }
 
-func (c *Client) sync(key interface{}) SyncState {
-	defer c.queue.Done(key)
-
-	switch k := key.(type) {
-	case svcKey:
-		l := log.With(c.logger, "service", string(k))
-		svc, exists, err := c.svcIndexer.GetByKey(string(k))
-		if err != nil {
-			level.Error(l).Log("op", "getService", "error", err, "msg", "failed to get service")
-			return SyncStateError
+func webhookServer(cfg *Config) webhook.Server {
+	disableHTTP2 := func(c *tls.Config) {
+		if cfg.WebhookWithHTTP2 {
+			return
 		}
-		if !exists {
-			return c.serviceChanged(l, string(k), nil, EpsOrSlices{})
-		}
-
-		epsOrSlices := EpsOrSlices{}
-		if c.epIndexer != nil {
-			epsIntf, exists, err := c.epIndexer.GetByKey(string(k))
-			if err != nil {
-				level.Error(l).Log("op", "getEndpoints", "error", err, "msg", "failed to get endpoints")
-				return SyncStateError
-			}
-			if !exists {
-				return c.serviceChanged(l, string(k), nil, EpsOrSlices{})
-			}
-
-			eps := epsIntf.(*v1.Endpoints)
-			epsOrSlices.EpVal = eps.DeepCopy()
-			epsOrSlices.Type = Eps
-		}
-		if c.slicesIndexer != nil {
-			slicesIntf, err := c.slicesIndexer.ByIndex(slicesServiceIndexName, string(k))
-			if err != nil {
-				level.Error(l).Log("op", "getEndpointSlices", "error", err, "msg", "failed to get endpoints slices")
-				return SyncStateError
-			}
-			if len(slicesIntf) == 0 {
-				return c.serviceChanged(l, string(k), nil, EpsOrSlices{})
-			}
-			epsOrSlices.SlicesVal = make([]*discovery.EndpointSlice, 0)
-			for _, s := range slicesIntf {
-				slice, ok := s.(*discovery.EndpointSlice)
-				if !ok {
-					continue
-				}
-				epsOrSlices.SlicesVal = append(epsOrSlices.SlicesVal, slice.DeepCopy())
-			}
-			epsOrSlices.Type = Slices
-		}
-		return c.serviceChanged(l, string(k), svc.(*v1.Service), epsOrSlices)
-
-	case cmKey:
-		l := log.With(c.logger, "configmap", string(k))
-		cmi, exists, err := c.cmIndexer.GetByKey(string(k))
-		if err != nil {
-			level.Error(l).Log("op", "getConfigMap", "error", err, "msg", "failed to get configmap")
-			return SyncStateError
-		}
-		if !exists {
-			configStale.Set(1)
-			return c.configChanged(l, nil)
-		}
-
-		// Note that configs that we can read, but that fail parsing
-		// or validation, result in a "synced" state, because the
-		// config is not going to parse any better until the k8s
-		// object changes to fix the issue.
-		cm := cmi.(*v1.ConfigMap)
-		cfg, err := config.Parse([]byte(cm.Data["config"]))
-		if err != nil {
-			level.Error(l).Log("event", "configStale", "error", err, "msg", "config (re)load failed, config marked stale")
-			configStale.Set(1)
-			return SyncStateSuccess
-		}
-
-		st := c.configChanged(l, cfg)
-		if st == SyncStateError {
-			level.Error(l).Log("event", "configStale", "error", err, "msg", "config (re)load failed, config marked stale")
-			configStale.Set(1)
-			return SyncStateSuccess
-		}
-
-		configLoaded.Set(1)
-		configStale.Set(0)
-
-		level.Info(l).Log("event", "configLoaded", "msg", "config (re)loaded")
-		return st
-
-	case nodeKey:
-		l := log.With(c.logger, "node", string(k))
-		n, exists, err := c.nodeIndexer.GetByKey(string(k))
-		if err != nil {
-			level.Error(l).Log("op", "getNode", "error", err, "msg", "failed to get node")
-			return SyncStateError
-		}
-		if !exists {
-			level.Error(l).Log("op", "getNode", "error", "node doesn't exist in k8s, but I'm running on it!")
-			return SyncStateError
-		}
-		node := n.(*v1.Node)
-		return c.nodeChanged(c.logger, node)
-
-	case synced:
-		if c.synced != nil {
-			c.synced(c.logger)
-		}
-		return SyncStateSuccess
-
-	default:
-		panic(fmt.Errorf("unknown key type for %#v (%T)", key, key))
+		c.NextProtos = []string{"http/1.1"}
 	}
-}
 
-func serviceKeyForSlice(endpointSlice *discovery.EndpointSlice) (svcKey, error) {
-	if endpointSlice == nil {
-		return "", fmt.Errorf("nil EndpointSlice")
+	webhookServerOptions := webhook.Options{
+		TLSOpts: []func(*tls.Config){disableHTTP2, cfg.TLSOpt},
+		Port:    9443,
 	}
-	serviceName, err := serviceNameForSlice(endpointSlice)
-	if err != nil {
-		return "", err
-	}
-	return svcKey(fmt.Sprintf("%s/%s", endpointSlice.Namespace, serviceName)), nil
-}
 
-func slicesServiceIndex(obj interface{}) ([]string, error) {
-	endpointSlice, ok := obj.(*discovery.EndpointSlice)
-	if !ok {
-		return nil, fmt.Errorf("Passed object is not a slice")
-	}
-	serviceKey, err := serviceKeyForSlice(endpointSlice)
-	if err != nil {
-		return nil, err
-	}
-	return []string{string(serviceKey)}, nil
-}
-
-func serviceNameForSlice(endpointSlice *discovery.EndpointSlice) (string, error) {
-	serviceName, ok := endpointSlice.Labels["kubernetes.io/service-name"]
-	if !ok || serviceName == "" {
-		return "", fmt.Errorf("endpointSlice missing %s label", "kubernetes.io/service-name")
-	}
-	return serviceName, nil
-}
-
-// UseEndpointSlices detect if Endpoints Slices are enabled in the cluster.
-func UseEndpointSlices(kubeClient kubernetes.Interface) bool {
-	if _, err := kubeClient.Discovery().ServerResourcesForGroupVersion(discovery.SchemeGroupVersion.String()); err != nil {
-		return false
-	}
-	// this is needed to check if ep slices are enabled on the cluster. In 1.17 the resources are there but disabled by default
-	if _, err := kubeClient.DiscoveryV1beta1().EndpointSlices("default").Get(context.Background(), "kubernetes", metav1.GetOptions{}); err != nil {
-		return false
-	}
-	return true
+	res := webhook.NewServer(webhookServerOptions)
+	return res
 }

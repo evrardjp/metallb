@@ -77,13 +77,18 @@ currently have, relative to the top-level directory:
   Kubernetes apiserver to get and modify service information. It
   allows most of the rest of the MetalLB code to be ignorant of the
   Kubernetes client library, other than the objects (Service,
-  ConfigMap...) that they manipulate.
-- `internal/config` parses and validates the MetalLB configmap.
+  CRs...) that they manipulate.
+- `internal/config` parses and validates the MetalLB Custom Resources (e.g., IPAddressPool, L2Advertisement)
 - `internal/allocator` is the IP address manager. Given pools from the
-  MetalLB configmap, it can allocate addresses on demand.
-- `internal/bgp` is a _very_ stripped down implementation of BGP. It
+  IPAddressPool Custom Resource, it can allocate addresses on demand.
+- `internal/bgp/native` is a _very_ stripped down implementation of BGP. It
   speaks just enough of the protocol to keep peering sessions up, and
   to push routes to the peer.
+- `internal/bgp/frr` contains the code for translating the MetalLB configuration
+   to the FRR configuration that is applied to the FRR container, when running
+   MetalLB in FRR mode (deprecated).
+- `internal/bgp/frrk8s` contains the code for translating the MetalLB configuration
+   to FRR-K8s CRDs, when running MetalLB in FRR-K8s mode (default).
 - `internal/layer2` is an implementation of an ARP and NDP responder.
 - `internal/logging` is a logging shim that redirects both
   Kubernetes's `klog` and Go's standard library `log` output to
@@ -96,9 +101,9 @@ currently have, relative to the top-level directory:
 In addition to code, there's deployment configuration and
 documentation:
 
-- `manifests` contains a variety of Kubernetes manifests. The most
-  important one is `manifests/metallb.yaml`, which specifies how to
-  deploy MetalLB onto a cluster.
+- `config/manifests` contains a variety of Kubernetes manifests for deploying
+  MetalLB onto a cluster (e.g. `metallb-frr-k8s.yaml` for the default FRR-K8s
+  mode, `metallb-native.yaml` for native mode).
 - `website` contains the website for MetalLB. The `website/content`
   subdirectory is where all the pages live, in Markdown format.
 
@@ -113,7 +118,7 @@ To develop MetalLB, you'll need a couple of pieces of software:
   running system
 - [kind](https://github.com/kubernetes-sigs/kind), a lightweight Kubernetes cluster running in Docker
 - [Kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/), the Kubernetes commandline interface
-- [Invoke](https://www.pyinvoke.org) to drive the build system
+- Install python dependencies with command `pip3 install -r dev-env/requirements.txt`
 
 >NOTE: The development environment was tested with **kind `v0.9.0`**. Older
 >versions may not work since there have been breaking changes between minor
@@ -150,9 +155,24 @@ the [github repository](https://github.com/metallb/metallb), and add
 your fork as a remote in `$GOPATH/src/go.universe.tf/metallb`, with
 `git remote add fork git@github.com:<your-github-user>/metallb.git`.
 
+## Commit Messages
+
+The following are our commit message guidelines:
+
+- Line wrap the body at 72 characters
+- For a more complete discussion of good git commit message practices, see
+  <https://chris.beams.io/posts/git-commit/>.
+
+## Extending the end to end test suite
+
+When adding a new feature, or modifying a current one, consider adding a new test
+to the test suite located in `/e2etest`.
+Each feature should come with enough unit test / end to end coverage to make
+us confident of the change.
+
 ## The website
 
-The website at https://metallb.universe.tf is pinned to the latest
+The website at <https://metallb.io> is pinned to the latest
 released version, so that users who don't care about ongoing
 development see documentation that is consistent with the released
 code.

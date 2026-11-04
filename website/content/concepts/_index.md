@@ -40,12 +40,17 @@ providing cluster services to your LAN.
 Or, you could do both! MetalLB lets you define as many address pools
 as you want, and doesn't care what "kind" of addresses you give it.
 
+When one or more IPs are assigned to a service, MetalLB tries to keep
+them assigned to that service. In case of removal of those IPs from the pools
+(deletion or edit of the IPAddressPool those IPs are taken from),
+MetalLB will assign another set of IPs to the service (when available). 
+
 ## External announcement
 
 After MetalLB has assigned an external IP address to a service, it
 needs to make the network beyond the cluster aware that the IP "lives"
-in the cluster. MetalLB uses standard routing protocols to achieve
-this: ARP, NDP, or BGP.
+in the cluster. MetalLB uses standard networking or routing protocols to achieve
+this, depending on which mode is used: ARP, NDP, or BGP.
 
 ### Layer 2 mode (ARP/NDP)
 

@@ -1,20 +1,23 @@
+// SPDX-License-Identifier:Apache-2.0
+
 package layer2
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/mdlayher/arp"
 	"github.com/mdlayher/ethernet"
 )
 
-type announceFunc func(net.IP) dropReason
+type announceFunc func(net.IP, string) dropReason
 
-type arpResponder struct {
+type arpClient struct {
 	logger       log.Logger
 	intf         string
 	hardwareAddr net.HardwareAddr
@@ -23,13 +26,13 @@ type arpResponder struct {
 	announce     announceFunc
 }
 
-func newARPResponder(logger log.Logger, ifi *net.Interface, ann announceFunc) (*arpResponder, error) {
+func newARPClient(logger log.Logger, ifi *net.Interface, ann announceFunc) (*arpClient, error) {
 	client, err := arp.Dial(ifi)
 	if err != nil {
 		return nil, fmt.Errorf("creating ARP responder for %q: %s", ifi.Name, err)
 	}
 
-	ret := &arpResponder{
+	ret := &arpClient{
 		logger:       logger,
 		intf:         ifi.Name,
 		hardwareAddr: ifi.HardwareAddr,
@@ -41,14 +44,14 @@ func newARPResponder(logger log.Logger, ifi *net.Interface, ann announceFunc) (*
 	return ret, nil
 }
 
-func (a *arpResponder) Interface() string { return a.intf }
+func (a *arpClient) Interface() string { return a.intf }
 
-func (a *arpResponder) Close() error {
+func (a *arpClient) Close() error {
 	close(a.closed)
 	return a.conn.Close()
 }
 
-func (a *arpResponder) Gratuitous(ip net.IP) error {
+func (a *arpClient) Gratuitous(ip net.IP) error {
 	for _, op := range []arp.Operation{arp.OperationRequest, arp.OperationReply} {
 		pkt, err := arp.NewPacket(op, a.hardwareAddr, ip, ethernet.Broadcast, ip)
 		if err != nil {
@@ -62,23 +65,23 @@ func (a *arpResponder) Gratuitous(ip net.IP) error {
 	return nil
 }
 
-func (a *arpResponder) run() {
+func (a *arpClient) run() {
 	for a.processRequest() != dropReasonClosed {
 	}
 }
 
-func (a *arpResponder) processRequest() dropReason {
+func (a *arpClient) processRequest() dropReason {
 	pkt, eth, err := a.conn.Read()
 	if err != nil {
 		// ARP listener doesn't cleanly return EOF when closed, so we
-		// need to hook into the call to arpResponder.Close()
+		// need to hook into the call to arpClient.Close()
 		// independently.
 		select {
 		case <-a.closed:
 			return dropReasonClosed
 		default:
 		}
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return dropReasonClosed
 		}
 		return dropReasonError
@@ -95,7 +98,11 @@ func (a *arpResponder) processRequest() dropReason {
 	}
 
 	// Ignore ARP requests that the announcer tells us to ignore.
-	if reason := a.announce(pkt.TargetIP); reason != dropReasonNone {
+	reason := a.announce(pkt.TargetIP, a.intf)
+	if reason == dropReasonNotMatchInterface {
+		level.Debug(a.logger).Log("op", "arpRequestIgnore", "ip", pkt.TargetIP, "interface", a.intf, "reason", "notMatchInterface")
+	}
+	if reason != dropReasonNone {
 		return reason
 	}
 

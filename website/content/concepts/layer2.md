@@ -67,6 +67,51 @@ about 10s), please [file a bug](https://github.com/metallb/metallb/issues/new)!
 We can help you investigate and determine if the issue is with the client, or a
 bug in MetalLB.
 
+## Periodic gratuitous announcements
+
+By default MetalLB only sends gratuitous ARP/NDP packets on failover. MetalLB
+does reply to ARP requests and NDP Neighbor Solicitations for announced service
+VIPs. In some environments — for example, switches that age FDB
+entries faster than upstream gateways age their ARP cache — this can result
+in periodic packet loss for service IPs even without a leadership change,
+because nothing refreshes the switch's forwarding tables between failovers.
+To work around this, the speaker
+can be configured to re-emit gratuitous ARP/NDP packets for every announced IP
+on a fixed interval, via the `--gratuitous-arp-interval` flag (or the
+`speaker.gratuitousARPInterval` Helm value). The value is in
+seconds; `0` (the default) keeps the original failover-only behaviour.
+
+The interval applies speaker-wide to every L2-announced IP on the node, so
+very short intervals on speakers announcing many IPs across many interfaces
+can produce a noticeable amount of broadcast traffic and slow down the
+speaker's handling of service updates. As a rule of thumb, pick the largest
+interval that is still shorter than your switch's FDB aging time.
+
+## How the L2 leader election works
+
+The election of the "leader" (the node which is going to advertise the IP) of a
+given loadbalancer IP is stateless and works in the following way:
+
+- each speaker collects the list of the potential announcers of a given IP, taking
+into account active speakers, external traffic policy, active endpoints, node selectors and other things.
+- each speaker does the same computation: it gets a sorted list of a hash of "node+VIP" elements and
+announces the service if it is the first item of the list.
+
+This removes the need of having to keep memory of which speaker is in charge of
+announcing a given IP.
+
+### Adding or removing nodes
+
+Given the leader election algorithm described above, removing a node does not change the
+speaker announcing the VIP, while adding a node will change it only if it becomes the new
+first element of the list.
+
+### Brain split behaviour
+
+Given the stateless nature of the mechanism, if a speaker mistakenly detects a set of nodes as
+non active, it might calculate a different list, resulting in multiple (or no) speakers announcing the
+same VIP.
+
 ## Comparison to Keepalived
 
 MetalLB's layer2 mode has a lot of similarities to Keepalived, so if you're

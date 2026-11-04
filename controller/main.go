@@ -17,7 +17,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
@@ -25,12 +24,16 @@ import (
 	"go.universe.tf/metallb/internal/allocator"
 	"go.universe.tf/metallb/internal/config"
 	"go.universe.tf/metallb/internal/k8s"
+	"go.universe.tf/metallb/internal/k8s/controllers"
 	"go.universe.tf/metallb/internal/logging"
+	"go.universe.tf/metallb/internal/tlsconfig"
 	"go.universe.tf/metallb/internal/version"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	v1 "k8s.io/api/core/v1"
+	discovery "k8s.io/api/discovery/v1"
 )
 
 // Service offers methods to mutate a Kubernetes service object.
@@ -42,27 +45,30 @@ type service interface {
 
 type controller struct {
 	client service
-	synced bool
-	config *config.Config
+	pools  *config.Pools
 	ips    *allocator.Allocator
 }
 
-func (c *controller) SetBalancer(l log.Logger, name string, svcRo *v1.Service, _ k8s.EpsOrSlices) k8s.SyncState {
+func (c *controller) SetBalancer(l log.Logger, name string, svcRo *v1.Service, _ []discovery.EndpointSlice) controllers.SyncState {
 	level.Debug(l).Log("event", "startUpdate", "msg", "start of service update")
 	defer level.Debug(l).Log("event", "endUpdate", "msg", "end of service update")
 
 	if svcRo == nil {
-		c.deleteBalancer(l, name)
-		// There might be other LBs stuck waiting for an IP, so when
-		// we delete a balancer we should reprocess all of them to
-		// check for newly feasible balancers.
-		return k8s.SyncStateReprocessAll
+		if c.isServiceAllocated(name) {
+			c.ips.Unassign(name)
+			level.Info(l).Log("event", "serviceDeleted", "msg", "service deleted")
+			// There might be other LBs stuck waiting for an IP, so when
+			// we delete a balancer we should reprocess all of them to
+			// check for newly feasible balancers.
+			return controllers.SyncStateReprocessAll
+		}
+		return controllers.SyncStateSuccess
 	}
 
-	if c.config == nil {
+	if c.pools == nil || c.pools.ByName == nil {
 		// Config hasn't been read, nothing we can do just yet.
 		level.Debug(l).Log("event", "noConfig", "msg", "not processing, still waiting for config")
-		return k8s.SyncStateSuccess
+		return controllers.SyncStateSuccess
 	}
 
 	// Making a copy unconditionally is a bit wasteful, since we don't
@@ -70,66 +76,107 @@ func (c *controller) SetBalancer(l log.Logger, name string, svcRo *v1.Service, _
 	// copy makes the code much easier to follow, and we have a GC for
 	// a reason.
 	svc := svcRo.DeepCopy()
-	if !c.convergeBalancer(l, name, svc) {
-		return k8s.SyncStateError
+	syncStateRes := controllers.SyncStateSuccess
+
+	prevIPs := c.ips.IPs(name)
+	prevAllocKey := c.ips.AllocationKey(name)
+
+	if c.convergeBalancer(l, name, svc) != nil {
+		syncStateRes = controllers.SyncStateErrorNoRetry
 	}
+
+	newAllocKey := c.ips.AllocationKey(name)
+
+	if prevAllocKey != newAllocKey {
+		level.Debug(l).Log("event", "allocation key changed", "msg", "allocation changed for shared service, reprocessing")
+		syncStateRes = controllers.SyncStateReprocessAll
+	}
+
 	if reflect.DeepEqual(svcRo, svc) {
 		level.Debug(l).Log("event", "noChange", "msg", "service converged, no change")
-		return k8s.SyncStateSuccess
+		return syncStateRes
 	}
 
-	if !reflect.DeepEqual(svcRo.Status, svc.Status) {
-		var st v1.ServiceStatus
-		st, svc = svc.Status, svcRo.DeepCopy()
-		svc.Status = st
-		if err := c.client.UpdateStatus(svc); err != nil {
-			level.Error(l).Log("op", "updateServiceStatus", "error", err, "msg", "failed to update service status")
-			return k8s.SyncStateError
+	// Check for any deprecated annotations.
+	// Normally, we would check the svc object within convergeBalancer.
+	// However, generating an event every time the svc is processed would be very noisy.
+	// Therefore, we check for deprecated annotations only, if there is something to do.
+	for key := range svcRo.Annotations {
+		if strings.HasPrefix(key, DeprecatedAnnotationPrefix) {
+			level.Warn(l).Log("event", "deprecatedAnnotation", "annotation", key, "msg", "The used annotation is deprecated. Support might get removed in future versions")
+			c.client.Errorf(svcRo, "deprecatedAnnotation", "Service uses deprecated annotation %s", key)
 		}
 	}
-	level.Info(l).Log("event", "serviceUpdated", "msg", "updated service object")
 
-	return k8s.SyncStateSuccess
-}
-
-func (c *controller) deleteBalancer(l log.Logger, name string) {
-	if c.ips.Unassign(name) {
-		level.Info(l).Log("event", "serviceDeleted", "msg", "service deleted")
+	if len(prevIPs) != 0 && !c.isServiceAllocated(name) {
+		// Only reprocess all if the previous IP(s) are still contained within a pool.
+		if c.ips.PoolForIP(prevIPs) != nil {
+			// convergeBalancer may deallocate our service and this means it did it.
+			// if the service was deallocated, it may have left room
+			// for another one, so we reprocess
+			level.Info(l).Log("event", "serviceUpdated", "msg", "removed loadbalancer from service, services will be reprocessed")
+			syncStateRes = controllers.SyncStateReprocessAll
+		}
 	}
+
+	toWrite := svcRo.DeepCopy()
+	if !reflect.DeepEqual(svcRo.Status, svc.Status) {
+		toWrite.Status = svc.Status
+	}
+
+	if !reflect.DeepEqual(svcRo.Annotations, svc.Annotations) {
+		toWrite.Annotations = svc.Annotations
+	}
+
+	if !reflect.DeepEqual(toWrite, svcRo) {
+		if err := c.client.UpdateStatus(svc); err != nil {
+			level.Error(l).Log("op", "updateServiceStatus", "error", err, "msg", "failed to update service")
+			return controllers.SyncStateError
+		}
+		level.Info(l).Log("event", "serviceUpdated", "msg", "updated service object")
+		return syncStateRes
+	}
+
+	level.Info(l).Log("event", "serviceUpdated", "msg", "service is not updated")
+	return syncStateRes
 }
 
-func (c *controller) SetConfig(l log.Logger, cfg *config.Config) k8s.SyncState {
+func (c *controller) SetPools(l log.Logger, pools *config.Pools) controllers.SyncState {
 	level.Debug(l).Log("event", "startUpdate", "msg", "start of config update")
 	defer level.Debug(l).Log("event", "endUpdate", "msg", "end of config update")
 
-	if cfg == nil {
+	if pools == nil || pools.ByName == nil {
 		level.Error(l).Log("op", "setConfig", "error", "no MetalLB configuration in cluster", "msg", "configuration is missing, MetalLB will not function")
-		return k8s.SyncStateError
+		return controllers.SyncStateErrorNoRetry
 	}
 
-	if err := c.ips.SetPools(cfg.Pools); err != nil {
-		level.Error(l).Log("op", "setConfig", "error", err, "msg", "applying new configuration failed")
-		return k8s.SyncStateError
-	}
-	c.config = cfg
-	return k8s.SyncStateReprocessAll
-}
+	c.ips.SetPools(pools)
+	c.pools = pools
 
-func (c *controller) MarkSynced(l log.Logger) {
-	c.synced = true
-	level.Info(l).Log("event", "stateSynced", "msg", "controller synced, can allocate IPs now")
+	return controllers.SyncStateReprocessAll
 }
 
 func main() {
 	var (
-		port            = flag.Int("port", 7472, "HTTP listening port for Prometheus metrics")
-		config          = flag.String("config", "config", "Kubernetes ConfigMap containing MetalLB's configuration")
-		namespace       = flag.String("namespace", os.Getenv("METALLB_NAMESPACE"), "config / memberlist secret namespace")
-		kubeconfig      = flag.String("kubeconfig", "", "absolute path to the kubeconfig file (only needed when running outside of k8s)")
-		mlSecret        = flag.String("ml-secret-name", os.Getenv("METALLB_ML_SECRET_NAME"), "name of the memberlist secret to create")
-		deployName      = flag.String("deployment", os.Getenv("METALLB_DEPLOYMENT"), "name of the MetalLB controller Deployment")
-		logLevel        = flag.String("log-level", "info", fmt.Sprintf("log level. must be one of: [%s]", strings.Join(logging.Levels, ", ")))
-		disableEpSlices = flag.Bool("disable-epslices", false, "Disable the usage of EndpointSlices and default to Endpoints instead of relying on the autodiscovery mechanism")
+		port                = flag.Int("port", 9120, "HTTPS listening port for Prometheus metrics; set to 0 to disable metrics")
+		namespace           = flag.String("namespace", os.Getenv("METALLB_NAMESPACE"), "config / memberlist secret namespace")
+		mlSecret            = flag.String("ml-secret-name", os.Getenv("METALLB_ML_SECRET_NAME"), "name of the memberlist secret to create")
+		deployName          = flag.String("deployment", os.Getenv("METALLB_DEPLOYMENT"), "name of the MetalLB controller Deployment")
+		logLevel            = flag.String("log-level", "info", fmt.Sprintf("log level. must be one of: [%s]", logging.Levels.String()))
+		pprofBindAddress    = flag.String("pprof-bind-address", "", "Bind address for pprof endpoint (e.g. 127.0.0.1:6060). Empty disables pprof.")
+		healthProbePort     = flag.Int("health-probe-port", k8s.DefaultHealthProbePort, "Port for health probe endpoint")
+		disableCertRotation = flag.Bool("disable-cert-rotation", false, "disable automatic generation and rotation of webhook TLS certificates/keys")
+		certDir             = flag.String("cert-dir", "/tmp/k8s-webhook-server/serving-certs", "The directory where certs are stored")
+		certServiceName     = flag.String("cert-service-name", "metallb-webhook-service", "The service name used to generate the TLS cert's hostname")
+		loadBalancerClass   = flag.String("lb-class", "", "load balancer class. When enabled, metallb will handle only services whose spec.loadBalancerClass matches the given lb class")
+		webhookMode         = flag.String("webhook-mode", "enabled", "webhook mode: can be enabled, disabled or only webhook if we want the controller to act as webhook endpoint only")
+		webhookSecretName   = flag.String("webhook-secret", "metallb-webhook-cert", "webhook secret: the name of webhook secret, default is metallb-webhook-cert")
+		myPod               = flag.String("pod-name", os.Getenv("METALLB_POD_NAME"), "name of this MetalLB controller pod")
+		webhookHTTP2        = flag.Bool("webhook-http2", false, "enables http2 for the webhook endpoint")
+		tlsMinVersion       = flag.String("tls-min-version", "", "Minimum TLS version (VersionTLS12 or VersionTLS13). If empty, defaults to VersionTLS13.")
+		tlsCipherSuites     = flag.String("tls-cipher-suites", "", "Comma-separated list of TLS cipher suites. Only applies to TLS 1.2. If empty, uses Go defaults.")
+		tlsCurvePreferences = flag.String("tls-curve-preferences", "", "Comma-separated list of numeric CurveID values (see https://pkg.go.dev/crypto/tls#CurveID). If empty, uses Go defaults.")
+		metricsCertDir      = flag.String("metrics-cert-dir", "", "Directory containing tls.crt and tls.key for metrics TLS. If empty, auto-generated self-signed cert is used.")
 	)
 	flag.Parse()
 
@@ -141,8 +188,16 @@ func main() {
 
 	level.Info(logger).Log("version", version.Version(), "commit", version.CommitHash(), "branch", version.Branch(), "goversion", version.GoString(), "msg", "MetalLB controller starting "+version.String())
 
+	tlsOpt, err := tlsconfig.OptFor(*tlsCipherSuites, *tlsCurvePreferences, *tlsMinVersion)
+	if err != nil {
+		level.Error(logger).Log("op", "startup", "error", err, "msg", "failed to parse TLS configuration")
+		os.Exit(1)
+	}
+
+	level.Info(logger).Log("op", "startup", "tls-min-version", *tlsMinVersion, "tls-cipher-suites", *tlsCipherSuites, "tls-curve-preferences", *tlsCurvePreferences)
+
 	if *namespace == "" {
-		bs, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+		bs, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 		if err != nil {
 			level.Error(logger).Log("op", "startup", "msg", "Unable to get namespace from pod service account data, please specify --namespace or METALLB_NAMESPACE", "error", err)
 			os.Exit(1)
@@ -150,23 +205,64 @@ func main() {
 		*namespace = string(bs)
 	}
 
+	poolStatusChan := make(chan event.GenericEvent)
 	c := &controller{
-		ips: allocator.New(),
+		ips: allocator.New(func(name string) {
+			poolStatusChan <- controllers.NewPoolStatusEvent(*namespace, name)
+		}),
 	}
 
-	client, err := k8s.New(&k8s.Config{
-		ProcessName:     "metallb-controller",
-		ConfigMapName:   *config,
-		ConfigMapNS:     *namespace,
-		MetricsPort:     *port,
-		Logger:          logger,
-		Kubeconfig:      *kubeconfig,
-		DisableEpSlices: *disableEpSlices,
+	bgpType, present := os.LookupEnv("METALLB_BGP_TYPE")
+	if !present {
+		bgpType = "native"
+	}
 
-		ServiceChanged: c.SetBalancer,
-		ConfigChanged:  c.SetConfig,
-		Synced:         c.MarkSynced,
-	})
+	if bgpType == "frr" {
+		level.Warn(logger).Log("op", "startup", "msg", "The FRR mode is deprecated and will be removed in a future release. Please migrate to the frr-k8s mode, which is now the default BGP backend. See https://metallb.io/concepts/bgp/#frr-k8s-mode for details.")
+	}
+
+	validation := config.ValidationFor(bgpType)
+
+	cfg := &k8s.Config{
+		ProcessName:            "metallb-controller",
+		PodName:                *myPod,
+		MetricsPort:            *port,
+		PprofBindAddress:       *pprofBindAddress,
+		HealthProbeBindAddress: fmt.Sprintf(":%d", *healthProbePort),
+		Logger:                 logger,
+
+		Namespace: *namespace,
+		Listener: k8s.Listener{
+			ServiceChanged: c.SetBalancer,
+			PoolChanged:    c.SetPools,
+		},
+		ValidateConfig:      validation,
+		EnableWebhook:       true,
+		WebhookWithHTTP2:    *webhookHTTP2,
+		TLSOpt:              tlsOpt,
+		DisableCertRotation: *disableCertRotation,
+		MetricsCertDir:      *metricsCertDir,
+		WebhookSecretName:   *webhookSecretName,
+		CertDir:             *certDir,
+		CertServiceName:     *certServiceName,
+		LoadBalancerClass:   *loadBalancerClass,
+		PoolStatusChan:      poolStatusChan,
+		PoolCountersFetcher: c.ips.CountersForPool,
+	}
+	switch *webhookMode {
+	case "enabled":
+		cfg.EnableWebhook = true
+	case "disabled":
+		cfg.EnableWebhook = false
+	case "onlywebhook":
+		cfg.EnableWebhook = true
+		cfg.Listener = k8s.Listener{}
+	default:
+		level.Error(logger).Log("op", "startup", "error", "invalid webhookmode value", "value", *webhookMode)
+		os.Exit(1)
+	}
+
+	client, err := k8s.New(cfg)
 	if err != nil {
 		level.Error(logger).Log("op", "startup", "error", err, "msg", "failed to create k8s client")
 		os.Exit(1)
@@ -183,5 +279,6 @@ func main() {
 	c.client = client
 	if err := client.Run(nil); err != nil {
 		level.Error(logger).Log("op", "startup", "error", err, "msg", "failed to run k8s client")
+		os.Exit(1)
 	}
 }
